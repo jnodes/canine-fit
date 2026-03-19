@@ -197,6 +197,15 @@ class ApiService {
   async getMe() {
     return this.request('/auth/me');
   }
+
+  // Leaderboard (Premium)
+  async getGlobalLeaderboard() {
+    return this.request('/leaderboard');
+  }
+
+  async getBreedLeaderboard(breed: string) {
+    return this.request(`/leaderboard/${encodeURIComponent(breed)}`);
+  }
 }
 
 export const api = new ApiService();

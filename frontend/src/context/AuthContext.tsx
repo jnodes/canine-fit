@@ -152,3 +152,21 @@ export function useAuth() {
   }
   return context;
 }
+
+export function usePremium() {
+  const { user } = useAuth();
+  return {
+    isPremium: user?.is_premium ?? false,
+    isFree: !user?.is_premium,
+    canAccessPremium: user?.is_premium ?? false,
+  };
+}
+
+export function isPremiumError(error: any): boolean {
+  if (!error) return false;
+  const detail = error?.response?.data?.detail;
+  if (typeof detail === 'object') {
+    return detail?.error === 'premium_required' || detail?.error === 'dog_limit_reached';
+  }
+  return error?.response?.data?.detail === 'premium_required';
+}

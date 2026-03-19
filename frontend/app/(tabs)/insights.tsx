@@ -1,4 +1,4 @@
-import React, { useRef, useEffect } from 'react';
+import React, { useRef, useEffect, useState } from 'react';
 import {
   View,
   Text,
@@ -11,7 +11,10 @@ import {
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { Ionicons } from '@expo/vector-icons';
+import { useRouter } from 'expo-router';
 import { LinearGradient } from 'expo-linear-gradient';
+import { usePremium } from '../../src/context/AuthContext';
+import UpgradePrompt from '../../src/components/UpgradePrompt';
 
 // Lilo AI companion image
 const LILO_IMAGE = require('../../assets/lilo.jpg');
@@ -34,8 +37,12 @@ const COLORS = {
 };
 
 export default function InsightsScreen() {
+  const router = useRouter();
   const fadeAnim = useRef(new Animated.Value(0)).current;
   const slideAnim = useRef(new Animated.Value(30)).current;
+  const { isPremium } = usePremium();
+  const [showUpgradeModal, setShowUpgradeModal] = useState(false);
+  const [lockedFeature, setLockedFeature] = useState('');
 
   useEffect(() => {
     Animated.parallel([
@@ -51,6 +58,11 @@ export default function InsightsScreen() {
       }),
     ]).start();
   }, []);
+
+  const handlePremiumAction = (feature: string) => {
+    setLockedFeature(feature);
+    setShowUpgradeModal(true);
+  };
 
   const weeklyData = [
     { day: 'Mon', score: 88, height: 75 },
@@ -211,19 +223,34 @@ export default function InsightsScreen() {
           </View>
         </Animated.View>
 
-        {/* Breed Leaderboard */}
+        {/* Breed Leaderboard - Premium */}
         <Animated.View style={[styles.leaderboardCard, { opacity: fadeAnim }]}>
           <View style={styles.leaderboardHeader}>
             <View style={styles.leaderboardTitle}>
               <Ionicons name="trophy" size={20} color={COLORS.warning} />
               <Text style={styles.leaderboardTitleText}>Golden Retriever Leaderboard</Text>
+              {!isPremium && (
+                <View style={styles.premiumBadge}>
+                  <Ionicons name="diamond" size={10} color={COLORS.warning} />
+                </View>
+              )}
             </View>
-            <TouchableOpacity>
-              <Text style={styles.viewAllBtn}>View All</Text>
+            <TouchableOpacity onPress={() => isPremium ? router.push('/leaderboard') : handlePremiumAction('Breed Leaderboard')}>
+              <Text style={[styles.viewAllBtn, !isPremium && styles.viewAllBtnLocked]}>View All</Text>
             </TouchableOpacity>
           </View>
           
-          {breedLeaderboard.map((dog) => (
+          {!isPremium ? (
+            <TouchableOpacity style={styles.lockedContent} onPress={() => handlePremiumAction('Breed Leaderboard')}>
+              <Ionicons name="lock-closed" size={32} color={COLORS.textSecondary} />
+              <Text style={styles.lockedText}>Upgrade to Premium to view leaderboard</Text>
+              <View style={styles.upgradeCta}>
+                <Ionicons name="sparkles" size={14} color={COLORS.warning} />
+                <Text style={styles.upgradeCtaText}>Unlock with Premium</Text>
+              </View>
+            </TouchableOpacity>
+          ) : (
+            breedLeaderboard.map((dog) => (
             <View 
               key={dog.rank} 
               style={[
@@ -250,14 +277,17 @@ export default function InsightsScreen() {
                 {dog.score} pts
               </Text>
             </View>
-          ))}
+          )))}
         </Animated.View>
 
-        {/* Food Safety Quick Check */}
+        {/* Food Safety Quick Check - Premium */}
         <Animated.View style={{ opacity: fadeAnim }}>
-          <TouchableOpacity style={styles.foodCheckCard}>
+          <TouchableOpacity 
+            style={styles.foodCheckCard}
+            onPress={() => isPremium ? null : handlePremiumAction('Food Safety Database')}
+          >
             <LinearGradient
-              colors={[COLORS.navy, '#2563EB']}
+              colors={[isPremium ? COLORS.navy : COLORS.cardLight, isPremium ? '#2563EB' : '#374151']}
               start={{ x: 0, y: 0 }}
               end={{ x: 1, y: 0 }}
               style={styles.foodCheckGradient}
@@ -274,6 +304,12 @@ export default function InsightsScreen() {
           </TouchableOpacity>
         </Animated.View>
       </ScrollView>
+      
+      <UpgradePrompt
+        visible={showUpgradeModal}
+        onClose={() => setShowUpgradeModal(false)}
+        feature={lockedFeature}
+      />
     </SafeAreaView>
   );
 }
@@ -500,6 +536,41 @@ const styles = StyleSheet.create({
   leaderboardTitle: {
     flexDirection: 'row',
     alignItems: 'center',
+  },
+  premiumBadge: {
+    marginLeft: 8,
+    backgroundColor: 'rgba(245, 158, 11, 0.2)',
+    paddingHorizontal: 6,
+    paddingVertical: 2,
+    borderRadius: 4,
+  },
+  viewAllBtnLocked: {
+    color: COLORS.warning,
+  },
+  lockedContent: {
+    alignItems: 'center',
+    paddingVertical: 32,
+  },
+  lockedText: {
+    color: COLORS.textSecondary,
+    fontSize: 14,
+    marginTop: 12,
+    textAlign: 'center',
+  },
+  upgradeCta: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginTop: 12,
+    backgroundColor: 'rgba(245, 158, 11, 0.1)',
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+    borderRadius: 16,
+    gap: 4,
+  },
+  upgradeCtaText: {
+    color: COLORS.warning,
+    fontSize: 12,
+    fontWeight: '600',
   },
   leaderboardTitleText: {
     fontSize: 15,

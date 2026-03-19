@@ -347,6 +347,35 @@ async def get_optional_user(authorization: Optional[str] = Header(None)) -> Opti
     
     return await db.users.find_one({"id": user_id})
 
+def require_premium(current_user: dict = Depends(get_current_user)) -> dict:
+    """Dependency that requires an active premium subscription."""
+    if not current_user.get("is_premium", False):
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "error": "premium_required",
+                "message": "This feature requires a premium subscription",
+                "upgrade_url": "/subscription"
+            }
+        )
+    return current_user
+
+def check_subscription_status(user: dict) -> dict:
+    """Check if user's subscription is still active."""
+    if not user.get("is_premium", False):
+        return {"tier": "free", "premium": False}
+    
+    expires = user.get("subscription_expires")
+    if expires and isinstance(expires, datetime):
+        if expires < datetime.utcnow():
+            return {"tier": "free", "premium": False, "expired": True}
+    
+    return {
+        "tier": user.get("subscription_plan", "premium"),
+        "premium": True,
+        "expires": expires
+    }
+
 # ============== Auth Routes ==============
 
 @api_router.post("/auth/signup", response_model=AuthResponse)
@@ -486,6 +515,22 @@ async def get_dogs(current_user: dict = Depends(get_current_user)):
 
 @api_router.post("/dogs", response_model=Dog)
 async def create_dog(dog_data: DogCreate, current_user: dict = Depends(get_current_user)):
+    """Create a new dog profile. Free users limited to 1 dog."""
+    # Check if free user has reached dog limit
+    if not current_user.get("is_premium", False):
+        existing_dogs_count = await db.dogs.count_documents({"owner_id": current_user["id"]})
+        if existing_dogs_count >= 1:
+            raise HTTPException(
+                status_code=403,
+                detail={
+                    "error": "dog_limit_reached",
+                    "message": "Free accounts are limited to 1 dog. Upgrade to premium for unlimited dogs.",
+                    "upgrade_url": "/subscription",
+                    "current_dogs": existing_dogs_count,
+                    "max_dogs": 1
+                }
+            )
+    
     dog = Dog(
         **dog_data.dict(),
         owner_id=current_user["id"]
@@ -751,7 +796,8 @@ Only output the JSON, nothing else."""
         }
 
 @api_router.get("/lilo-ai/{dog_id}", response_model=List[LiloReport])
-async def get_lilo_reports(dog_id: str, current_user: dict = Depends(get_current_user)):
+async def get_lilo_reports(dog_id: str, current_user: dict = Depends(require_premium)):
+    """Get Lilo AI reports for a dog. Premium feature."""
     dog = await db.dogs.find_one({"id": dog_id, "owner_id": current_user["id"]})
     if not dog:
         raise HTTPException(status_code=404, detail="Dog not found")
@@ -760,7 +806,8 @@ async def get_lilo_reports(dog_id: str, current_user: dict = Depends(get_current
     return [LiloReport(**report) for report in reports]
 
 @api_router.post("/lilo-ai/{dog_id}", response_model=LiloReport)
-async def generate_lilo_report(dog_id: str, current_user: dict = Depends(get_current_user)):
+async def generate_lilo_report(dog_id: str, current_user: dict = Depends(require_premium)):
+    """Generate new Lilo AI report. Premium feature."""
     dog = await db.dogs.find_one({"id": dog_id, "owner_id": current_user["id"]})
     if not dog:
         raise HTTPException(status_code=404, detail="Dog not found")
@@ -991,7 +1038,8 @@ TOXIC_FOODS = {
 }
 
 @api_router.get("/food-search")
-async def search_food(query: str):
+async def search_food(query: str, current_user: dict = Depends(require_premium)):
+    """Search food safety database. Premium feature."""
     query_lower = query.lower()
     results = []
     
@@ -1103,11 +1151,11 @@ async def clear_ai_profiles(
         }
     }
 
-# ============== Enhanced Leaderboard ==============
+# ============== Enhanced Leaderboard (Premium) ==============
 
 @api_router.get("/leaderboard/{breed}")
-async def get_breed_leaderboard(breed: str, limit: int = 50):
-    """Get leaderboard for a specific breed"""
+async def get_breed_leaderboard(breed: str, current_user: dict = Depends(require_premium), limit: int = 50):
+    """Get leaderboard for a specific breed. Premium feature."""
     # Get all dogs of this breed with their healthspan stats
     pipeline = [
         {"$match": {"breed": breed}},
@@ -1152,8 +1200,8 @@ async def get_breed_leaderboard(breed: str, limit: int = 50):
     return leaderboard
 
 @api_router.get("/leaderboard")
-async def get_global_leaderboard(limit: int = 100):
-    """Get global leaderboard across all breeds"""
+async def get_global_leaderboard(current_user: dict = Depends(require_premium), limit: int = 100):
+    """Get global leaderboard across all breeds. Premium feature."""
     pipeline = [
         {"$lookup": {
             "from": "healthspan_stats",
