@@ -1,0 +1,154 @@
+import React, { createContext, useContext, useState, useEffect, ReactNode } from 'react';
+import AsyncStorage from '@react-native-async-storage/async-storage';
+import api from '../services/api';
+
+interface User {
+  id: string;
+  email: string;
+  name: string;
+  is_premium?: boolean;
+  subscription_status?: string;
+  subscription_plan?: string;
+  subscription_expires?: string;
+}
+
+interface Dog {
+  id: string;
+  name: string;
+  breed: string;
+  avatar_url?: string;
+  date_of_birth?: string;
+  weight_lbs?: number;
+  sex?: string;
+  activity_level?: string;
+  owner_id: string;
+}
+
+interface AuthContextType {
+  user: User | null;
+  dogs: Dog[];
+  currentDog: Dog | null;
+  isLoading: boolean;
+  isAuthenticated: boolean;
+  login: (email: string, password: string) => Promise<void>;
+  signup: (email: string, password: string, name: string) => Promise<void>;
+  logout: () => Promise<void>;
+  refreshDogs: () => Promise<void>;
+  setCurrentDog: (dog: Dog) => void;
+  addDog: (dogData: Omit<Dog, 'id' | 'owner_id'>) => Promise<Dog>;
+}
+
+const AuthContext = createContext<AuthContextType | undefined>(undefined);
+
+export function AuthProvider({ children }: { children: ReactNode }) {
+  const [user, setUser] = useState<User | null>(null);
+  const [dogs, setDogs] = useState<Dog[]>([]);
+  const [currentDog, setCurrentDog] = useState<Dog | null>(null);
+  const [isLoading, setIsLoading] = useState(true);
+
+  useEffect(() => {
+    loadStoredAuth();
+  }, []);
+
+  const loadStoredAuth = async () => {
+    try {
+      await api.init();
+      const storedUser = await AsyncStorage.getItem('user');
+      const storedDog = await AsyncStorage.getItem('current_dog');
+      
+      if (storedUser && api.getToken()) {
+        setUser(JSON.parse(storedUser));
+        await refreshDogs();
+        if (storedDog) {
+          setCurrentDog(JSON.parse(storedDog));
+        }
+      }
+    } catch (error) {
+      console.error('Failed to load auth:', error);
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const login = async (email: string, password: string) => {
+    const data = await api.login(email, password);
+    setUser(data.user);
+    await AsyncStorage.setItem('user', JSON.stringify(data.user));
+    await refreshDogs();
+  };
+
+  const signup = async (email: string, password: string, name: string) => {
+    const data = await api.signup(email, password, name);
+    setUser(data.user);
+    await AsyncStorage.setItem('user', JSON.stringify(data.user));
+  };
+
+  const logout = async () => {
+    try {
+      await api.logout();
+    } finally {
+      setUser(null);
+      setDogs([]);
+      setCurrentDog(null);
+      await AsyncStorage.multiRemove(['user', 'current_dog', 'auth_token']);
+    }
+  };
+
+  const refreshDogs = async () => {
+    try {
+      const dogsData = await api.getDogs();
+      setDogs(dogsData);
+      
+      // Auto-select first dog if none selected
+      if (dogsData.length > 0 && !currentDog) {
+        const firstDog = dogsData[0];
+        setCurrentDog(firstDog);
+        await AsyncStorage.setItem('current_dog', JSON.stringify(firstDog));
+      }
+    } catch (error) {
+      console.error('Failed to refresh dogs:', error);
+    }
+  };
+
+  const handleSetCurrentDog = async (dog: Dog) => {
+    setCurrentDog(dog);
+    await AsyncStorage.setItem('current_dog', JSON.stringify(dog));
+  };
+
+  const addDog = async (dogData: Omit<Dog, 'id' | 'owner_id'>) => {
+    const newDog = await api.createDog(dogData);
+    setDogs(prev => [...prev, newDog]);
+    if (!currentDog) {
+      handleSetCurrentDog(newDog);
+    }
+    return newDog;
+  };
+
+  return (
+    <AuthContext.Provider
+      value={{
+        user,
+        dogs,
+        currentDog,
+        isLoading,
+        isAuthenticated: !!user,
+        login,
+        signup,
+        logout,
+        refreshDogs,
+        setCurrentDog: handleSetCurrentDog,
+        addDog,
+      }}
+    >
+      {children}
+    </AuthContext.Provider>
+  );
+}
+
+export function useAuth() {
+  const context = useContext(AuthContext);
+  if (context === undefined) {
+    throw new Error('useAuth must be used within an AuthProvider');
+  }
+  return context;
+}
