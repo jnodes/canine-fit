@@ -15,6 +15,7 @@ import { useRouter } from 'expo-router';
 import { LinearGradient } from 'expo-linear-gradient';
 import { usePremium } from '../../src/context/AuthContext';
 import UpgradePrompt from '../../src/components/UpgradePrompt';
+import WeatherWidget from '../../src/components/WeatherWidget';
 
 // Lilo AI companion image
 const LILO_IMAGE = require('../../assets/lilo.jpg');
@@ -140,6 +141,9 @@ export default function InsightsScreen() {
           <Text style={styles.title}>Insights</Text>
           <Text style={styles.subtitle}>AI-powered health analysis for Max</Text>
         </Animated.View>
+
+        {/* Weather Widget - FREE feature */}
+        <WeatherWidget />
 
         {/* Weekly Score Chart */}
         <Animated.View style={[styles.chartCard, { opacity: fadeAnim }]}>

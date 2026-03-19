@@ -45,6 +45,15 @@ from emergentintegrations.payments.stripe.checkout import StripeCheckout, Checko
 # LLM integration for Lilo AI
 from emergentintegrations.llm.chat import LlmChat, UserMessage
 
+# External services
+from external_services import (
+    search_breeds, get_breed_by_id, get_breed_health_insights,
+    search_foods, get_food_by_id, analyze_food_for_dogs,
+    get_current_weather, get_forecast, analyze_walk_conditions, find_best_walk_times,
+    get_air_quality, analyze_air_quality,
+    calculate_healthspan_contribution
+)
+
 # Create the main app
 app = FastAPI(title="Canine.Fit API", version="1.0.0")
 
@@ -1056,6 +1065,108 @@ async def search_food(query: str, current_user: dict = Depends(require_premium))
         return {"message": f"No information found for '{query}'. When in doubt, consult your vet."}
     
     return results
+
+# ============== External API Services ==============
+
+@api_router.get("/breeds/search")
+async def api_search_breeds(q: str, limit: int = 10):
+    """Search dog breeds by name (Free feature)."""
+    breeds = await search_breeds(q)
+    return {"breeds": breeds[:limit]}
+
+@api_router.get("/breeds/{breed_id}/insights")
+async def api_get_breed_insights(breed_id: str, current_user: dict = Depends(get_current_user)):
+    """Get health insights for a specific breed. Uses Dog API for accurate data."""
+    breed = await get_breed_by_id(breed_id)
+    if not breed:
+        # Try searching by name as fallback
+        search_results = await search_breeds(breed_id)
+        if search_results:
+            breed = search_results[0]
+        else:
+            raise HTTPException(status_code=404, detail="Breed not found")
+    
+    insights = get_breed_health_insights(breed)
+    return insights
+
+@api_router.post("/foods/search")
+async def api_search_foods_usda(query: str, limit: int = 10, current_user: dict = Depends(require_premium)):
+    """Search foods using USDA database with accurate nutrition info. Premium feature."""
+    foods = await search_foods(query, limit)
+    results = [analyze_food_for_dogs(food) for food in foods]
+    return {"foods": results}
+
+@api_router.get("/foods/{fdc_id}")
+async def api_get_food_details(fdc_id: str, current_user: dict = Depends(require_premium)):
+    """Get detailed nutrition info for a specific food from USDA. Premium feature."""
+    food = await get_food_by_id(fdc_id)
+    if not food:
+        raise HTTPException(status_code=404, detail="Food not found")
+    
+    analysis = analyze_food_for_dogs(food)
+    return analysis
+
+@api_router.get("/weather/current")
+async def api_get_weather(lat: float, lon: float, current_user: dict = Depends(get_current_user)):
+    """
+    Get current weather and walk recommendations. FREE for all users.
+    This is a value-add feature to attract new users.
+    """
+    weather = await get_current_weather(lat, lon)
+    if not weather:
+        raise HTTPException(status_code=503, detail="Weather service unavailable")
+    
+    analysis = analyze_walk_conditions(weather)
+    return {
+        "weather": weather,
+        "walk_analysis": analysis
+    }
+
+@api_router.get("/weather/forecast")
+async def api_get_weather_forecast(lat: float, lon: float, hours: int = 24, current_user: dict = Depends(get_current_user)):
+    """
+    Get weather forecast with best walk times. FREE for all users.
+    """
+    forecast = await get_forecast(lat, lon, hours)
+    if not forecast:
+        raise HTTPException(status_code=503, detail="Forecast service unavailable")
+    
+    best_times = find_best_walk_times(forecast)
+    
+    return {
+        "forecast": forecast,
+        "best_walk_times": best_times
+    }
+
+@api_router.get("/air-quality")
+async def api_get_air_quality(zip_code: str, current_user: dict = Depends(require_premium)):
+    """Get air quality index for location. Premium feature."""
+    aqi_data = await get_air_quality(zip_code)
+    if not aqi_data:
+        raise HTTPException(status_code=503, detail="Air quality service unavailable")
+    
+    analysis = analyze_air_quality(aqi_data)
+    return analysis
+
+@api_router.post("/healthspan/calculate")
+async def api_calculate_healthspan(
+    activity_score: float,
+    nutrition_score: float,
+    environmental_score: float,
+    breed_baseline: float = 85.0,
+    current_user: dict = Depends(get_current_user)
+):
+    """
+    Calculate healthspan score based on multiple factors.
+    Returns overall score, component scores, and projected impact.
+    """
+    result = calculate_healthspan_contribution(
+        activity_score,
+        nutrition_score,
+        environmental_score,
+        breed_baseline
+    )
+    return result
 
 # ============== Root Route ==============
 

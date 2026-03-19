@@ -206,6 +206,56 @@ class ApiService {
   async getBreedLeaderboard(breed: string) {
     return this.request(`/leaderboard/${encodeURIComponent(breed)}`);
   }
+
+  // Weather (Free - value-add feature)
+  async getWeather(lat: number, lon: number) {
+    return this.request(`/weather/current?lat=${lat}&lon=${lon}`);
+  }
+
+  async getWeatherForecast(lat: number, lon: number, hours: number = 24) {
+    return this.request(`/weather/forecast?lat=${lat}&lon=${lon}&hours=${hours}`);
+  }
+
+  // Breeds (Free)
+  async searchBreeds(query: string, limit: number = 10) {
+    return this.request(`/breeds/search?q=${encodeURIComponent(query)}&limit=${limit}`);
+  }
+
+  async getBreedInsights(breedId: string) {
+    return this.request(`/breeds/${encodeURIComponent(breedId)}/insights`);
+  }
+
+  // Foods (Premium)
+  async searchFoods(query: string, limit: number = 10) {
+    return this.request(`/foods/search?query=${encodeURIComponent(query)}&limit=${limit}`);
+  }
+
+  async getFoodDetails(fdcId: string) {
+    return this.request(`/foods/${fdcId}`);
+  }
+
+  // Air Quality (Premium)
+  async getAirQuality(zipCode: string) {
+    return this.request(`/air-quality?zip_code=${zipCode}`);
+  }
+
+  // Healthspan Calculation
+  async calculateHealthspan(
+    activityScore: number,
+    nutritionScore: number,
+    environmentalScore: number,
+    breedBaseline: number = 85.0
+  ) {
+    return this.request('/healthspan/calculate', {
+      method: 'POST',
+      body: JSON.stringify({
+        activity_score: activityScore,
+        nutrition_score: nutritionScore,
+        environmental_score: environmentalScore,
+        breed_baseline: breedBaseline
+      })
+    });
+  }
 }
 
 export const api = new ApiService();
