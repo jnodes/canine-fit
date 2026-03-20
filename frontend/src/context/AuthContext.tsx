@@ -1,7 +1,8 @@
-import React, { createContext, useContext, useState, useEffect, ReactNode } from 'react';
+import React, { createContext, useContext, useState, useEffect, useCallback, ReactNode } from 'react';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import api from '../services/api';
 import { supabase, getUserProfile, DogProfile } from '../services/supabase';
+import { User as SupabaseUser } from '@supabase/supabase-js';
 
 // Use Supabase User type
 interface User {
@@ -38,7 +39,7 @@ interface AuthContextType {
   refreshDogs: () => Promise<void>;
   setCurrentDog: (dog: Dog) => void;
   addDog: (dogData: Omit<Dog, 'id' | 'owner_id'>) => Promise<Dog>;
-  supabaseUser: any; // Supabase auth user
+  supabaseUser: SupabaseUser | null;
 }
 
 const AuthContext = createContext<AuthContextType | undefined>(undefined);
@@ -46,9 +47,159 @@ const AuthContext = createContext<AuthContextType | undefined>(undefined);
 export function AuthProvider({ children }: { children: ReactNode }) {
   const [user, setUser] = useState<User | null>(null);
   const [dogs, setDogs] = useState<Dog[]>([]);
-  const [currentDog, setCurrentDog] = useState<Dog | null>(null);
+  const [currentDog, setCurrentDogState] = useState<Dog | null>(null);
   const [isLoading, setIsLoading] = useState(true);
-  const [supabaseUser, setSupabaseUser] = useState<any>(null);
+  const [supabaseUser, setSupabaseUser] = useState<SupabaseUser | null>(null);
+
+  const refreshDogs = useCallback(async () => {
+    try {
+      const dogsData = await api.getDogs();
+      setDogs(dogsData);
+      
+      // Auto-select first dog if none selected
+      if (dogsData.length > 0 && !currentDog) {
+        const firstDog = dogsData[0];
+        setCurrentDogState(firstDog);
+        await AsyncStorage.setItem('current_dog', JSON.stringify(firstDog));
+      }
+    } catch (error) {
+      console.error('Failed to refresh dogs:', error);
+    }
+  }, [currentDog]);
+
+  const loadUserData = useCallback(async (userId: string) => {
+    try {
+      // Get user profile from Supabase
+      const profile = await getUserProfile();
+      if (profile) {
+        setUser({
+          id: profile.id,
+          email: profile.email,
+          name: profile.name,
+          is_premium: profile.is_premium,
+          subscription_status: profile.subscription_status ?? undefined,
+          subscription_plan: profile.subscription_plan ?? undefined,
+          subscription_expires: profile.subscription_expires ?? undefined,
+        });
+        await AsyncStorage.setItem('user', JSON.stringify(profile));
+      }
+      
+      // Also sync with backend API
+      await api.init();
+      await refreshDogs();
+      
+      // Load stored dog selection
+      const storedDog = await AsyncStorage.getItem('current_dog');
+      if (storedDog) {
+        setCurrentDogState(JSON.parse(storedDog));
+      }
+    } catch (error) {
+      console.error('Failed to load user data:', error);
+    } finally {
+      setIsLoading(false);
+    }
+  }, [refreshDogs]);
+
+  const loadStoredAuth = useCallback(async () => {
+    try {
+      await api.init();
+      const storedUser = await AsyncStorage.getItem('user');
+      const storedDog = await AsyncStorage.getItem('current_dog');
+      
+      if (storedUser && api.getToken()) {
+        setUser(JSON.parse(storedUser));
+        await refreshDogs();
+        if (storedDog) {
+          setCurrentDogState(JSON.parse(storedDog));
+        }
+      } else {
+        setIsLoading(false);
+      }
+    } catch (error) {
+      console.error('Failed to load auth:', error);
+      setIsLoading(false);
+    }
+  }, [refreshDogs]);
+
+  const login = useCallback(async (email: string, password: string) => {
+    // Try Supabase Auth first
+    try {
+      const { data, error } = await supabase.auth.signInWithPassword({
+        email,
+        password,
+      });
+      
+      if (error) throw error;
+      
+      // Sync with backend if needed
+      await api.login(email, password);
+      await loadUserData(data.user.id);
+    } catch (supabaseError: any) {
+      // Fallback to backend-only auth
+      const data = await api.login(email, password);
+      setUser(data.user);
+      await AsyncStorage.setItem('user', JSON.stringify(data.user));
+      await refreshDogs();
+    }
+  }, [loadUserData, refreshDogs]);
+
+  const signup = useCallback(async (email: string, password: string, name: string) => {
+    // Use Supabase Auth
+    const { data, error } = await supabase.auth.signUp({
+      email,
+      password,
+      options: {
+        data: { name },
+      },
+    });
+    
+    if (error) throw error;
+    
+    if (data.user) {
+      setSupabaseUser(data.user);
+      await loadUserData(data.user.id);
+    }
+    
+    // Also create backend account
+    try {
+      const backendData = await api.signup(email, password, name);
+      setUser(backendData.user);
+    } catch (backendError) {
+      console.log('Backend signup failed (may already exist):', backendError);
+    }
+  }, [loadUserData]);
+
+  const logout = useCallback(async () => {
+    try {
+      await supabase.auth.signOut();
+    } catch (e) {
+      console.log('Supabase logout failed:', e);
+    }
+    
+    try {
+      await api.logout();
+    } finally {
+      setUser(null);
+      setDogs([]);
+      setCurrentDogState(null);
+      setSupabaseUser(null);
+      await AsyncStorage.multiRemove(['user', 'current_dog', 'auth_token']);
+    }
+  }, []);
+
+  const handleSetCurrentDog = useCallback(async (dog: Dog) => {
+    setCurrentDogState(dog);
+    await AsyncStorage.setItem('current_dog', JSON.stringify(dog));
+  }, []);
+
+  const addDog = useCallback(async (dogData: Omit<Dog, 'id' | 'owner_id'>) => {
+    const newDog = await api.createDog(dogData);
+    setDogs(prev => [...prev, newDog]);
+    if (!currentDog) {
+      handleSetCurrentDog(newDog);
+    }
+    return newDog;
+  }, [currentDog, handleSetCurrentDog]);
 
   // Listen for Supabase auth changes
   useEffect(() => {
@@ -73,170 +224,20 @@ export function AuthProvider({ children }: { children: ReactNode }) {
           setSupabaseUser(null);
           setUser(null);
           setDogs([]);
-          setCurrentDog(null);
+          setCurrentDogState(null);
         }
       }
     );
 
     return () => subscription.unsubscribe();
-  }, []);
-
-  const loadUserData = async (userId: string) => {
-    try {
-      // Get user profile from Supabase
-      const profile = await getUserProfile();
-      if (profile) {
-        setUser({
-          id: profile.id,
-          email: profile.email,
-          name: profile.name,
-          is_premium: profile.is_premium,
-          subscription_status: profile.subscription_status ?? undefined,
-          subscription_plan: profile.subscription_plan ?? undefined,
-          subscription_expires: profile.subscription_expires ?? undefined,
-        });
-        await AsyncStorage.setItem('user', JSON.stringify(profile));
-      }
-      
-      // Also sync with backend API
-      await api.init();
-      await refreshDogs();
-      
-      // Load stored dog selection
-      const storedDog = await AsyncStorage.getItem('current_dog');
-      if (storedDog) {
-        setCurrentDog(JSON.parse(storedDog));
-      }
-    } catch (error) {
-      console.error('Failed to load user data:', error);
-    } finally {
-      setIsLoading(false);
-    }
-  };
-
-  const loadStoredAuth = async () => {
-    try {
-      await api.init();
-      const storedUser = await AsyncStorage.getItem('user');
-      const storedDog = await AsyncStorage.getItem('current_dog');
-      
-      if (storedUser && api.getToken()) {
-        setUser(JSON.parse(storedUser));
-        await refreshDogs();
-        if (storedDog) {
-          setCurrentDog(JSON.parse(storedDog));
-        }
-      } else {
-        setIsLoading(false);
-      }
-    } catch (error) {
-      console.error('Failed to load auth:', error);
-      setIsLoading(false);
-    }
-  };
-
-  const login = async (email: string, password: string) => {
-    // Try Supabase Auth first
-    try {
-      const { data, error } = await supabase.auth.signInWithPassword({
-        email,
-        password,
-      });
-      
-      if (error) throw error;
-      
-      // Sync with backend if needed
-      await api.login(email, password);
-      await loadUserData(data.user.id);
-    } catch (supabaseError: any) {
-      // Fallback to backend-only auth
-      const data = await api.login(email, password);
-      setUser(data.user);
-      await AsyncStorage.setItem('user', JSON.stringify(data.user));
-      await refreshDogs();
-    }
-  };
-
-  const signup = async (email: string, password: string, name: string) => {
-    // Use Supabase Auth
-    const { data, error } = await supabase.auth.signUp({
-      email,
-      password,
-      options: {
-        data: { name },
-      },
-    });
-    
-    if (error) throw error;
-    
-    if (data.user) {
-      setSupabaseUser(data.user);
-      await loadUserData(data.user.id);
-    }
-    
-    // Also create backend account
-    try {
-      const backendData = await api.signup(email, password, name);
-      setUser(backendData.user);
-    } catch (backendError) {
-      console.log('Backend signup failed (may already exist):', backendError);
-    }
-  };
-
-  const logout = async () => {
-    try {
-      await supabase.auth.signOut();
-    } catch (e) {
-      console.log('Supabase logout failed:', e);
-    }
-    
-    try {
-      await api.logout();
-    } finally {
-      setUser(null);
-      setDogs([]);
-      setCurrentDog(null);
-      setSupabaseUser(null);
-      await AsyncStorage.multiRemove(['user', 'current_dog', 'auth_token']);
-    }
-  };
-
-  const refreshDogs = async () => {
-    try {
-      const dogsData = await api.getDogs();
-      setDogs(dogsData);
-      
-      // Auto-select first dog if none selected
-      if (dogsData.length > 0 && !currentDog) {
-        const firstDog = dogsData[0];
-        setCurrentDog(firstDog);
-        await AsyncStorage.setItem('current_dog', JSON.stringify(firstDog));
-      }
-    } catch (error) {
-      console.error('Failed to refresh dogs:', error);
-    }
-  };
-
-  const handleSetCurrentDog = async (dog: Dog) => {
-    setCurrentDog(dog);
-    await AsyncStorage.setItem('current_dog', JSON.stringify(dog));
-  };
-
-  const addDog = async (dogData: Omit<Dog, 'id' | 'owner_id'>) => {
-    const newDog = await api.createDog(dogData);
-    setDogs(prev => [...prev, newDog]);
-    if (!currentDog) {
-      handleSetCurrentDog(newDog);
-    }
-    return newDog;
-  };
+  }, [loadUserData, loadStoredAuth]);
 
   return (
     <AuthContext.Provider
       value={{
         user,
         dogs,
-        currentDog,
+        currentDog: currentDog,
         isLoading,
         isAuthenticated: !!user || !!supabaseUser,
         login,

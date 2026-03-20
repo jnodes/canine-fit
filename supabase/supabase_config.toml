@@ -1,0 +1,81 @@
+# Supabase CLI configuration
+# https://supabase.com/docs/guides/cli/config
+
+[project]
+project_id = "your-project-id"  # Get from: supabase.com/dashboard → Settings → General
+
+[api]
+enabled = true
+port = 54321
+schemas = ["public", "storage", "graphql_public"]
+extra_search_path = ["public", "extensions"]
+max_rows = 1000
+
+[api.tls]
+enabled = false
+
+[db]
+port = 54322
+major_version = 15
+
+[studio]
+enabled = true
+port = 54323
+api_url = "http://127.0.0.1"
+
+[inbucket]
+enabled = true
+port = 54324
+smtp_port = 54325
+pop3_port = 54326
+
+[storage]
+enabled = true
+file_size_limit = "50MiB"
+
+[auth]
+enabled = true
+# Site URL for OAuth redirects
+site_url = "http://localhost:3000"
+additional_redirect_urls = ["https://localhost:3000"]
+# JWT expiry duration (in days)
+jwt_expiry = 7
+# Enable email auto-confirmation
+enable_signup = true
+enable_anonymous_sign_ins = false
+
+[auth.email]
+# Allow manual confirmation (set to false for production)
+enable_signup = true
+double_confirm_changes = false
+enable_confirmations = false
+
+[auth.sms]
+enabled = false
+
+[auth.external.apple]
+enabled = false
+client_id = ""
+secret = "env(SUPABASE_AUTH_EXTERNAL_APPLE_SECRET)"
+
+[auth.external.google]
+enabled = false
+client_id = ""
+secret = "env(SUPABASE_AUTH_EXTERNAL_GOOGLE_SECRET)"
+
+# Edge Runtime configuration
+[edge_runtime]
+enabled = true
+policy = "oneshot"
+inspector_port = 8083
+
+# Analytics
+[analytics]
+enabled = true
+port = 54325
+backend = "postgres"
+
+# Realtime
+[realtime]
+enabled = true
+ip_version = "IPv4"

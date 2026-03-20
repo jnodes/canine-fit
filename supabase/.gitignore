@@ -1,0 +1,15 @@
+# Supabase CLI - Local development config (don't commit secrets)
+supabase/.env
+supabase/config.toml
+supabase/.branches
+supabase/.temp
+
+# Supabase CLI auth (global)
+# ~/.config/supabase/config.json
+
+# Local Supabase instance data
+supabase/docker*
+
+# Environment variables (local override)
+.env.local
+.env.*.local

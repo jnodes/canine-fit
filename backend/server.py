@@ -1,49 +1,65 @@
-from fastapi import FastAPI, APIRouter, HTTPException, Depends, Header, Request, RequestHTTPException, Security
+"""
+Canine.Fit API Server - Supabase Edition
+Migrated from MongoDB to Supabase for simplified architecture.
+
+Key changes:
+- Uses Supabase Auth for authentication (no custom tokens)
+- Uses Supabase database with Row Level Security (RLS)
+- Service role client for admin operations
+- All other operations use authenticated client (RLS enforced)
+"""
+
+from fastapi import FastAPI, APIRouter, HTTPException, Depends, Header, Request, Security
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 from starlette.middleware.base import BaseHTTPMiddleware
-from motor.motor_asyncio import AsyncIOMotorClient
+from supabase import create_client, Client
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 import os
 import logging
 from pathlib import Path
-from pydantic import BaseModel, Field, validator, field_validator
+from pydantic import BaseModel, Field, field_validator
 from typing import List, Optional, Dict
 import uuid
 from datetime import datetime, date, timedelta
 import secrets
 import re
+import hmac
 
 # Security imports
-import bcrypt
 from slowapi.middleware import SlowAPIMiddleware
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
 
-# Rate limiter setup
-limiter = Limiter(key_func=get_remote_address)
-app.state.limiter = limiter
-app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+# ============== Supabase Configuration ==============
+SUPABASE_URL = os.environ.get('SUPABASE_URL', '')
+SUPABASE_ANON_KEY = os.environ.get('SUPABASE_ANON_KEY', '')
+SUPABASE_SERVICE_ROLE_KEY = os.environ.get('SUPABASE_SERVICE_ROLE_KEY', '')
 
-# MongoDB connection
-mongo_url = os.environ['MONGO_URL']
-client = AsyncIOMotorClient(mongo_url)
-db = client[os.environ.get('DB_NAME', 'canine_fit')]
+# Rate limiter setup (will be attached to app after creation)
+limiter = Limiter(key_func=get_remote_address)
+
+# Create Supabase clients
+# Regular client (uses RLS - for authenticated user operations)
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
+
+# Admin client (bypasses RLS - for admin operations only)
+from supabase import create_client as create_admin_client
+supabase_admin: Client = create_admin_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 
 # Security configuration
 ALLOWED_ORIGINS = os.environ.get('ALLOWED_ORIGINS', 'http://localhost:3000,https://dog-fitness-hub.preview.emergentagent.com').split(',')
-TOKEN_EXPIRE_HOURS = int(os.environ.get('TOKEN_EXPIRE_HOURS', 24))
 MAX_IMAGE_SIZE = int(os.environ.get('MAX_IMAGE_SIZE', 5000000))  # 5MB default
 
-# Stripe integration
-from emergentintegrations.payments.stripe.checkout import StripeCheckout, CheckoutSessionResponse, CheckoutStatusResponse, CheckoutSessionRequest
+# Stripe integration (native)
+from stripe_integration import StripeCheckout, CheckoutSessionResponse, CheckoutStatusResponse, CheckoutSessionRequest
 
-# LLM integration for Lilo AI
-from emergentintegrations.llm.chat import LlmChat, UserMessage
+# LLM integration for Lilo AI (native)
+from openai_integration import LlmChat, UserMessage
 
 # External services
 from external_services import (
@@ -55,7 +71,11 @@ from external_services import (
 )
 
 # Create the main app
-app = FastAPI(title="Canine.Fit API", version="1.0.0")
+app = FastAPI(title="Canine.Fit API", version="2.0.0", description="Powered by Supabase")
+
+# Attach rate limiter to app
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 # Create a router with versioned /api/v1 prefix
 api_router = APIRouter(prefix="/api/v1")
@@ -101,7 +121,7 @@ SUBSCRIPTION_PLANS = {
 
 # ============== Models ==============
 
-# Auth Models
+# Auth Models (using Supabase)
 class UserCreate(BaseModel):
     email: str
     password: str
@@ -142,7 +162,7 @@ class UserLogin(BaseModel):
         return v.lower().strip()
 
 class User(BaseModel):
-    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    id: str
     email: str
     name: str
     is_premium: bool = False
@@ -154,6 +174,7 @@ class User(BaseModel):
 class AuthResponse(BaseModel):
     user: User
     access_token: str
+    expires_in: int
 
 # Dog Models
 class DogCreate(BaseModel):
@@ -209,7 +230,7 @@ class DogUpdate(BaseModel):
         return v
 
 class Dog(BaseModel):
-    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    id: str
     name: str
     breed: str
     avatar_url: Optional[str] = None
@@ -220,16 +241,49 @@ class Dog(BaseModel):
     owner_id: str
     created_at: datetime = Field(default_factory=datetime.utcnow)
 
-# Daily Log (Combined)
+# Daily Log Enums (whitelist validation)
+DAILY_LOG_MOODS = {"great", "good", "okay", "tired", "unwell"}
+DAILY_LOG_EXERCISE_LEVELS = {"intense", "active", "moderate", "light", "none"}
+DAILY_LOG_NUTRITION_QUALITY = {"excellent", "good", "fair", "poor"}
+MAX_NOTES_LENGTH = 500
+
 class DailyLogCreate(BaseModel):
     dog_id: str
     mood: str
     exercise_level: str
     nutrition_quality: str
     notes: Optional[str] = None
+    
+    @field_validator('mood')
+    @classmethod
+    def validate_mood(cls, v: str) -> str:
+        if v.lower() not in DAILY_LOG_MOODS:
+            raise ValueError(f'Mood must be one of: {sorted(DAILY_LOG_MOODS)}')
+        return v.lower()
+    
+    @field_validator('exercise_level')
+    @classmethod
+    def validate_exercise(cls, v: str) -> str:
+        if v.lower() not in DAILY_LOG_EXERCISE_LEVELS:
+            raise ValueError(f'Exercise level must be one of: {sorted(DAILY_LOG_EXERCISE_LEVELS)}')
+        return v.lower()
+    
+    @field_validator('nutrition_quality')
+    @classmethod
+    def validate_nutrition(cls, v: str) -> str:
+        if v.lower() not in DAILY_LOG_NUTRITION_QUALITY:
+            raise ValueError(f'Nutrition quality must be one of: {sorted(DAILY_LOG_NUTRITION_QUALITY)}')
+        return v.lower()
+    
+    @field_validator('notes')
+    @classmethod
+    def validate_notes(cls, v: Optional[str]) -> Optional[str]:
+        if v and len(v) > MAX_NOTES_LENGTH:
+            raise ValueError(f'Notes must not exceed {MAX_NOTES_LENGTH} characters')
+        return v
 
 class DailyLog(BaseModel):
-    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    id: str
     dog_id: str
     logged_at: datetime = Field(default_factory=datetime.utcnow)
     date: str = Field(default_factory=lambda: date.today().isoformat())
@@ -241,7 +295,7 @@ class DailyLog(BaseModel):
 
 # Lilo Report Models
 class LiloReport(BaseModel):
-    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    id: str
     dog_id: str
     report_date: str = Field(default_factory=lambda: date.today().isoformat())
     mood: str
@@ -279,82 +333,68 @@ class PaymentTransaction(BaseModel):
     created_at: datetime = Field(default_factory=datetime.utcnow)
     updated_at: datetime = Field(default_factory=datetime.utcnow)
 
-# ============== Auth Helpers ==============
+# ============== Security Helpers ==============
 
-def hash_password(password: str) -> str:
-    """Hash password using bcrypt with automatic salt generation."""
-    salt = bcrypt.gensalt(rounds=12)
-    return bcrypt.hashpw(password.encode('utf-8'), salt).decode('utf-8')
+def secure_compare(a: str, b: str) -> bool:
+    """Constant-time string comparison to prevent timing attacks."""
+    return hmac.compare_digest(a, b)
 
-def verify_password(password: str, password_hash: str) -> bool:
-    """Verify password against bcrypt hash."""
-    try:
-        return bcrypt.checkpw(password.encode('utf-8'), password_hash.encode('utf-8'))
-    except Exception:
+def validate_admin_key(provided_key: Optional[str]) -> bool:
+    """Validate admin key with constant-time comparison."""
+    valid_key = os.environ.get('ADMIN_API_KEY')
+    if not valid_key or not provided_key:
         return False
+    return secure_compare(provided_key, valid_key)
 
-def generate_token() -> str:
-    """Generate secure random token."""
-    return secrets.token_urlsafe(32)
-
-def get_admin_key() -> Optional[str]:
-    """Get admin key from environment variable."""
-    return os.environ.get('ADMIN_API_KEY')
-
-# Token storage (MongoDB-backed for persistence)
-async def store_token(token: str, user_id: str, expires_at: datetime):
-    """Store token in database for persistence and revocation support."""
-    await db.auth_tokens.delete_many({"user_id": user_id})  # Remove old tokens for this user
-    await db.auth_tokens.insert_one({
-        "token": token,
-        "user_id": user_id,
-        "created_at": datetime.utcnow(),
-        "expires_at": expires_at
-    })
-
-async def get_user_id_from_token(token: str) -> Optional[str]:
-    """Get user ID from token, checking expiration."""
-    token_doc = await db.auth_tokens.find_one({
-        "token": token,
-        "expires_at": {"$gt": datetime.utcnow()}
-    })
-    return token_doc.get("user_id") if token_doc else None
-
-async def revoke_token(token: str):
-    """Revoke a specific token."""
-    await db.auth_tokens.delete_one({"token": token})
-
-async def revoke_all_user_tokens(user_id: str):
-    """Revoke all tokens for a user."""
-    await db.auth_tokens.delete_many({"user_id": user_id})
+# ============== Auth Dependencies (Supabase Auth) ==============
 
 async def get_current_user(authorization: Optional[str] = Header(None)) -> dict:
+    """
+    Get current authenticated user from Supabase Bearer token.
+    Uses Supabase Auth - no custom token management needed.
+    """
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Not authenticated")
     
-    token = authorization.replace("Bearer ", "")
-    user_id = await get_user_id_from_token(token)
+    token = authorization[7:].strip()
+    if not token:
+        raise HTTPException(status_code=401, detail="Not authenticated")
     
-    if not user_id:
+    # Set the session token
+    supabase.auth.session = lambda: {"access_token": token, "token_type": "Bearer"}
+    
+    try:
+        # Get user from Supabase Auth
+        user_response = supabase.auth.get_user(token)
+        if not user_response.user:
+            raise HTTPException(status_code=401, detail="Invalid or expired token")
+        
+        # Get user profile from database (includes subscription info)
+        profile_response = supabase.table('user_profiles').select('*').eq('id', user_response.user.id).execute()
+        
+        if profile_response.data:
+            user_data = profile_response.data[0]
+            user_data['email'] = user_response.user.email
+            return user_data
+        else:
+            # Profile might not exist yet (race condition on signup)
+            raise HTTPException(status_code=401, detail="User profile not found")
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Auth error: {e}")
         raise HTTPException(status_code=401, detail="Invalid or expired token")
-    
-    user = await db.users.find_one({"id": user_id})
-    if not user:
-        raise HTTPException(status_code=401, detail="User not found")
-    
-    return user
 
 async def get_optional_user(authorization: Optional[str] = Header(None)) -> Optional[dict]:
+    """Get current user if authenticated, None otherwise."""
     if not authorization or not authorization.startswith("Bearer "):
         return None
     
-    token = authorization.replace("Bearer ", "")
-    user_id = await get_user_id_from_token(token)
-    
-    if not user_id:
+    try:
+        return await get_current_user(authorization)
+    except HTTPException:
         return None
-    
-    return await db.users.find_one({"id": user_id})
 
 def require_premium(current_user: dict = Depends(get_current_user)) -> dict:
     """Dependency that requires an active premium subscription."""
@@ -375,8 +415,9 @@ def check_subscription_status(user: dict) -> dict:
         return {"tier": "free", "premium": False}
     
     expires = user.get("subscription_expires")
-    if expires and isinstance(expires, datetime):
-        if expires < datetime.utcnow():
+    if expires:
+        expires_dt = datetime.fromisoformat(expires.replace('Z', '+00:00')) if isinstance(expires, str) else expires
+        if expires_dt < datetime.utcnow():
             return {"tier": "free", "premium": False, "expired": True}
     
     return {
@@ -385,81 +426,125 @@ def check_subscription_status(user: dict) -> dict:
         "expires": expires
     }
 
-# ============== Auth Routes ==============
+# ============== Auth Routes (Supabase Auth) ==============
 
 @api_router.post("/auth/signup", response_model=AuthResponse)
 @limiter.limit("10/minute")
 async def signup(request: Request, user_data: UserCreate):
-    existing = await db.users.find_one({"email": user_data.email})
-    if existing:
-        raise HTTPException(status_code=400, detail="Email already registered")
-    
-    user = User(
-        email=user_data.email,
-        name=user_data.name
-    )
-    user_dict = user.dict()
-    user_dict["password_hash"] = hash_password(user_data.password)
-    
-    await db.users.insert_one(user_dict)
-    
-    token = generate_token()
-    expires_at = datetime.utcnow() + timedelta(hours=TOKEN_EXPIRE_HOURS)
-    await store_token(token, user.id, expires_at)
-    
-    return AuthResponse(user=user, access_token=token)
+    """
+    Create new user account using Supabase Auth.
+    User profile is auto-created by database trigger.
+    """
+    try:
+        # Create user in Supabase Auth
+        auth_response = supabase.auth.sign_up({
+            "email": user_data.email,
+            "password": user_data.password,
+            "options": {
+                "data": {
+                    "name": user_data.name
+                }
+            }
+        })
+        
+        if auth_response.user is None:
+            raise HTTPException(status_code=400, detail="Signup failed")
+        
+        # Supabase trigger creates user_profiles entry automatically
+        # Fetch the created profile
+        profile_response = supabase.table('user_profiles').select('*').eq('id', auth_response.user.id).execute()
+        
+        if not profile_response.data:
+            raise HTTPException(status_code=500, detail="Profile creation failed")
+        
+        user_profile = profile_response.data[0]
+        user_profile['email'] = auth_response.user.email
+        
+        return AuthResponse(
+            user=User(**user_profile),
+            access_token=auth_response.session.access_token,
+            expires_in=auth_response.session.expires_in
+        )
+        
+    except Exception as e:
+        if "already registered" in str(e).lower():
+            raise HTTPException(status_code=400, detail="Email already registered")
+        logger.error(f"Signup error: {e}")
+        raise HTTPException(status_code=500, detail="Signup failed")
 
 @api_router.post("/auth/login", response_model=AuthResponse)
 @limiter.limit("10/minute")
 async def login(request: Request, credentials: UserLogin):
-    user_doc = await db.users.find_one({"email": credentials.email})
-    
-    if not user_doc or not verify_password(credentials.password, user_doc.get("password_hash", "")):
-        # Use constant-time response to prevent timing attacks
+    """Login using Supabase Auth."""
+    try:
+        auth_response = supabase.auth.sign_in_with_password({
+            "email": credentials.email,
+            "password": credentials.password
+        })
+        
+        if auth_response.user is None:
+            raise HTTPException(status_code=401, detail="Invalid credentials")
+        
+        # Fetch user profile
+        profile_response = supabase.table('user_profiles').select('*').eq('id', auth_response.user.id).execute()
+        
+        if not profile_response.data:
+            raise HTTPException(status_code=404, detail="User profile not found")
+        
+        user_profile = profile_response.data[0]
+        user_profile['email'] = auth_response.user.email
+        
+        return AuthResponse(
+            user=User(**user_profile),
+            access_token=auth_response.session.access_token,
+            expires_in=auth_response.session.expires_in
+        )
+        
+    except Exception as e:
         raise HTTPException(status_code=401, detail="Invalid credentials")
-    
-    user = User(**{k: v for k, v in user_doc.items() if k != "password_hash"})
-    
-    token = generate_token()
-    expires_at = datetime.utcnow() + timedelta(hours=TOKEN_EXPIRE_HOURS)
-    await store_token(token, user.id, expires_at)
-    
-    return AuthResponse(user=user, access_token=token)
 
 @api_router.post("/auth/logout")
-async def logout(authorization: Optional[str] = Header(None), current_user: dict = Depends(get_current_user)):
-    if authorization and authorization.startswith("Bearer "):
-        token = authorization.replace("Bearer ", "")
-        await revoke_token(token)
+@limiter.limit("20/minute")
+async def logout(request: Request, authorization: Optional[str] = Header(None), current_user: dict = Depends(get_current_user)):
+    """Logout - invalidate Supabase session."""
+    try:
+        supabase.auth.sign_out()
+    except:
+        pass  # Best effort
     return {"message": "Logged out successfully"}
 
 @api_router.get("/auth/me")
 async def get_me(current_user: dict = Depends(get_current_user)):
-    return User(**{k: v for k, v in current_user.items() if k != "password_hash"})
+    """Get current user profile."""
+    return User(**current_user)
 
 # ============== GDPR / Privacy Routes ==============
 
 @api_router.get("/auth/export-data")
 async def export_user_data(current_user: dict = Depends(get_current_user)):
-    """Export all user data in JSON format (GDPR Article 20 - Right to Data Portability)"""
+    """Export all user data in JSON format (GDPR Article 20)"""
     user_id = current_user["id"]
     
+    # Use admin client to bypass RLS for export
     # Gather all user data
-    user_data = {k: v for k, v in current_user.items() if k != "password_hash"}
+    user_data = {k: v for k, v in current_user.items() if k not in ['password_hash', 'stripe_customer_id']}
     
     # Get user's dogs
-    dogs = await db.dogs.find({"owner_id": user_id}).to_list(1000)
-    dogs_data = [dict(dog) for dog in dogs]
+    dogs_response = supabase_admin.table('dogs').select('*').eq('owner_id', user_id).execute()
+    dogs = dogs_response.data
     
     # Get daily logs for each dog
-    dogs_ids = [dog["id"] for dog in dogs_data]
-    daily_logs = await db.daily_logs.find({"dog_id": {"$in": dogs_ids}}).to_list(10000)
+    dog_ids = [dog["id"] for dog in dogs]
+    daily_logs_response = supabase_admin.table('daily_logs').select('*').in_('dog_id', dog_ids).execute()
+    daily_logs = daily_logs_response.data
     
     # Get healthspan stats
-    healthspan_stats = await db.healthspan_stats.find({"dog_id": {"$in": dogs_ids}}).to_list(100)
+    healthspan_response = supabase_admin.table('healthspan_stats').select('*').in_('dog_id', dog_ids).execute()
+    healthspan_stats = healthspan_response.data
     
     # Get Lilo reports
-    lilo_reports = await db.lilo_reports.find({"dog_id": {"$in": dogs_ids}}).to_list(100)
+    reports_response = supabase_admin.table('lilo_reports').select('*').in_('dog_id', dog_ids).execute()
+    lilo_reports = reports_response.data
     
     # Get subscription info
     subscription_info = {
@@ -473,44 +558,45 @@ async def export_user_data(current_user: dict = Depends(get_current_user)):
         "exported_at": datetime.utcnow().isoformat(),
         "user": user_data,
         "subscription": subscription_info,
-        "dogs": dogs_data,
-        "daily_logs": [dict(log) for log in daily_logs],
-        "healthspan_stats": [dict(stat) for stat in healthspan_stats],
-        "lilo_reports": [dict(report) for report in lilo_reports]
+        "dogs": dogs,
+        "daily_logs": daily_logs,
+        "healthspan_stats": healthspan_stats,
+        "lilo_reports": lilo_reports
     }
     
     return export_data
 
 @api_router.delete("/auth/delete-account")
-async def delete_user_account(current_user: dict = Depends(get_current_user), authorization: Optional[str] = Header(None)):
-    """Delete all user data (GDPR Article 17 - Right to Erasure)
-    
-    WARNING: This action is irreversible. All user data, dogs, logs, and reports will be permanently deleted.
+async def delete_user_account(current_user: dict = Depends(get_current_user)):
+    """
+    Delete all user data (GDPR Article 17)
+    Uses Supabase Admin client for cascade delete.
     """
     user_id = current_user["id"]
     
-    # Get user's dogs
-    dogs = await db.dogs.find({"owner_id": user_id}).to_list(1000)
-    dog_ids = [dog["id"] for dog in dogs]
+    # Delete user from Supabase Auth (cascades to profiles via FK)
+    try:
+        supabase_admin.auth.admin.delete_user(user_id)
+    except Exception as e:
+        logger.error(f"Failed to delete auth user: {e}")
+        raise HTTPException(status_code=500, detail="Failed to delete account")
     
-    # Delete all related data
-    await db.daily_logs.delete_many({"dog_id": {"$in": dog_ids}})
-    await db.healthspan_stats.delete_many({"dog_id": {"$in": dog_ids}})
-    await db.lilo_reports.delete_many({"dog_id": {"$in": dog_ids}})
-    await db.dogs.delete_many({"owner_id": user_id})
-    await db.payment_transactions.delete_many({"user_id": user_id})
+    # Manual cleanup of any orphaned data (RLS might prevent cascade)
+    for dog in supabase_admin.table('dogs').select('id').eq('owner_id', user_id).execute().data:
+        supabase_admin.table('daily_logs').delete().eq('dog_id', dog['id']).execute()
+        supabase_admin.table('healthspan_stats').delete().eq('dog_id', dog['id']).execute()
+        supabase_admin.table('lilo_reports').delete().eq('dog_id', dog['id']).execute()
     
-    # Revoke all tokens
-    await revoke_all_user_tokens(user_id)
+    # Delete dogs
+    supabase_admin.table('dogs').delete().eq('owner_id', user_id).execute()
     
-    # Delete user account
-    await db.users.delete_one({"id": user_id})
+    # Delete payment transactions
+    supabase_admin.table('payment_transactions').delete().eq('user_id', user_id).execute()
     
     return {
         "message": "Account and all associated data have been permanently deleted",
         "deleted_data": {
-            "dogs": len(dog_ids),
-            "daily_logs": len(dog_ids),  # Approximate
+            "dogs": len(dog_ids) if 'dog_ids' in dir() else 0,
             "account": True
         }
     }
@@ -519,15 +605,19 @@ async def delete_user_account(current_user: dict = Depends(get_current_user), au
 
 @api_router.get("/dogs", response_model=List[Dog])
 async def get_dogs(current_user: dict = Depends(get_current_user)):
-    dogs = await db.dogs.find({"owner_id": current_user["id"]}).to_list(100)
-    return [Dog(**dog) for dog in dogs]
+    """Get all dogs for current user. RLS enforced."""
+    response = supabase.table('dogs').select('*').eq('owner_id', current_user['id']).execute()
+    return [Dog(**dog) for dog in response.data]
 
 @api_router.post("/dogs", response_model=Dog)
-async def create_dog(dog_data: DogCreate, current_user: dict = Depends(get_current_user)):
+@limiter.limit("10/minute")
+async def create_dog(request: Request, dog_data: DogCreate, current_user: dict = Depends(get_current_user)):
     """Create a new dog profile. Free users limited to 1 dog."""
     # Check if free user has reached dog limit
     if not current_user.get("is_premium", False):
-        existing_dogs_count = await db.dogs.count_documents({"owner_id": current_user["id"]})
+        existing_dogs_response = supabase.table('dogs').select('id', count='exact').eq('owner_id', current_user['id']).execute()
+        existing_dogs_count = len(existing_dogs_response.data)
+        
         if existing_dogs_count >= 1:
             raise HTTPException(
                 status_code=403,
@@ -540,114 +630,190 @@ async def create_dog(dog_data: DogCreate, current_user: dict = Depends(get_curre
                 }
             )
     
-    dog = Dog(
-        **dog_data.dict(),
-        owner_id=current_user["id"]
-    )
-    await db.dogs.insert_one(dog.dict())
-    return dog
+    # Create dog
+    dog_dict = dog_data.model_dump()
+    dog_dict['owner_id'] = current_user['id']
+    
+    response = supabase.table('dogs').insert(dog_dict).execute()
+    
+    if not response.data:
+        raise HTTPException(status_code=500, detail="Failed to create dog")
+    
+    return Dog(**response.data[0])
 
 @api_router.put("/dogs/{dog_id}", response_model=Dog)
 async def update_dog(dog_id: str, dog_data: DogUpdate, current_user: dict = Depends(get_current_user)):
-    dog = await db.dogs.find_one({"id": dog_id, "owner_id": current_user["id"]})
-    if not dog:
+    """Update dog. RLS enforces ownership."""
+    # Check ownership
+    check_response = supabase.table('dogs').select('id').eq('id', dog_id).eq('owner_id', current_user['id']).execute()
+    if not check_response.data:
         raise HTTPException(status_code=404, detail="Dog not found")
     
-    update_data = {k: v for k, v in dog_data.dict().items() if v is not None}
+    update_data = {k: v for k, v in dog_data.model_dump().items() if v is not None}
     if update_data:
-        await db.dogs.update_one({"id": dog_id}, {"$set": update_data})
+        response = supabase.table('dogs').update(update_data).eq('id', dog_id).execute()
+    else:
+        response = check_response
     
-    updated_dog = await db.dogs.find_one({"id": dog_id})
-    return Dog(**updated_dog)
+    return Dog(**response.data[0])
 
 @api_router.delete("/dogs/{dog_id}")
 async def delete_dog(dog_id: str, current_user: dict = Depends(get_current_user)):
-    result = await db.dogs.delete_one({"id": dog_id, "owner_id": current_user["id"]})
-    if result.deleted_count == 0:
+    """Delete dog. RLS enforces ownership."""
+    response = supabase.table('dogs').delete().eq('id', dog_id).eq('owner_id', current_user['id']).execute()
+    
+    if not response.data:
         raise HTTPException(status_code=404, detail="Dog not found")
+    
     return {"message": "Dog deleted successfully"}
 
 # Photo Upload Model
 class PhotoUpload(BaseModel):
     image_base64: str
 
+# Allowed image MIME types
+ALLOWED_IMAGE_TYPES = {'image/jpeg': '.jpg', 'image/png': '.png', 'image/webp': '.webp'}
+BLOCKED_IMAGE_TYPES = {'image/svg+xml', 'image/svg', 'text/html', 'application/html'}
+
+def validate_image_base64(image_data: str) -> tuple[bool, str, str]:
+    """Validate base64 image data for security."""
+    import base64
+    
+    if len(image_data) > MAX_IMAGE_SIZE:
+        return False, f"Image too large. Maximum size is {MAX_IMAGE_SIZE // 1000000}MB", ""
+    
+    mime_type = None
+    b64_data = image_data
+    
+    if image_data.startswith('data:'):
+        try:
+            header, b64_data = image_data.split(',', 1)
+            mime_type = header.split(';')[0].replace('data:', '')
+        except (ValueError, IndexError):
+            return False, "Invalid image format header", ""
+    
+    b64_clean = re.sub(r'\s', '', b64_data)
+    if not re.match(r'^[A-Za-z0-9+/=]*$', b64_clean):
+        return False, "Invalid base64 encoding", ""
+    
+    try:
+        image_bytes = base64.b64decode(b64_clean, validate=True)
+    except Exception:
+        return False, "Invalid base64 data", ""
+    
+    if len(image_bytes) < 50:
+        return False, "Image data too small", ""
+    
+    actual_mime = detect_image_type(image_bytes)
+    if not actual_mime:
+        return False, "Unrecognized image format", ""
+    
+    if actual_mime.lower() in BLOCKED_IMAGE_TYPES:
+        return False, f"Image type {actual_mime} is not allowed for security", ""
+    
+    if actual_mime.lower() not in [m.lower() for m in ALLOWED_IMAGE_TYPES.keys()]:
+        return False, f"Image type {actual_mime} is not supported. Allowed: JPEG, PNG, WebP", ""
+    
+    if mime_type and mime_type.lower() != actual_mime.lower():
+        return False, f"Image content ({actual_mime}) doesn't match claimed type ({mime_type})", ""
+    
+    validated_data = f"data:{actual_mime};base64,{b64_clean}"
+    return True, "", validated_data
+
+def detect_image_type(data: bytes) -> Optional[str]:
+    """Detect image type from magic bytes."""
+    if len(data) < 4:
+        return None
+    if data[0:3] == b'\xff\xd8\xff':
+        return 'image/jpeg'
+    if data[0:8] == b'\x89PNG\r\n\x1a\n':
+        return 'image/png'
+    if data[0:4] == b'RIFF' and data[8:12] == b'WEBP':
+        return 'image/webp'
+    try:
+        text_start = data[:100].decode('utf-8', errors='ignore').strip().lower()
+        if text_start.startswith('<svg') or text_start.startswith('<?xml'):
+            return 'image/svg+xml'
+    except:
+        pass
+    return None
+
 @api_router.post("/dogs/{dog_id}/photo")
 async def upload_dog_photo(dog_id: str, photo_data: PhotoUpload, current_user: dict = Depends(get_current_user)):
-    """Upload a dog's profile photo as base64"""
-    dog = await db.dogs.find_one({"id": dog_id, "owner_id": current_user["id"]})
-    if not dog:
+    """Upload a dog's profile photo. RLS enforces ownership."""
+    # Check ownership
+    check_response = supabase.table('dogs').select('id').eq('id', dog_id).eq('owner_id', current_user['id']).execute()
+    if not check_response.data:
         raise HTTPException(status_code=404, detail="Dog not found")
     
-    # Validate base64 image
-    image_base64 = photo_data.image_base64
+    is_valid, error_msg, validated_base64 = validate_image_base64(photo_data.image_base64)
+    if not is_valid:
+        raise HTTPException(status_code=400, detail=error_msg)
     
-    # Check size limit
-    if len(image_base64) > MAX_IMAGE_SIZE:
-        raise HTTPException(status_code=400, detail=f"Image too large. Maximum size is {MAX_IMAGE_SIZE // 1000000}MB")
+    response = supabase.table('dogs').update({
+        "avatar_url": validated_base64,
+        "updated_at": datetime.utcnow().isoformat()
+    }).eq('id', dog_id).execute()
     
-    # Validate base64 format
-    if not re.match(r'^[A-Za-z0-9+/=\s]*$', image_base64.replace('data:image/jpeg;base64,', '').replace('data:image/png;base64,', '').replace('data:image/webp;base64,', '')):
-        raise HTTPException(status_code=400, detail="Invalid image format")
-    
-    # If it doesn't start with data:image, add the prefix
-    if not image_base64.startswith('data:image'):
-        # Assume JPEG if no prefix
-        image_base64 = f"data:image/jpeg;base64,{image_base64}"
-    
-    # Update dog's avatar_url with base64 image
-    await db.dogs.update_one(
-        {"id": dog_id},
-        {"$set": {"avatar_url": image_base64, "updated_at": datetime.utcnow()}}
-    )
-    
-    updated_dog = await db.dogs.find_one({"id": dog_id})
-    return Dog(**updated_dog)
+    return Dog(**response.data[0])
 
 # ============== Daily Logs Routes ==============
 
 @api_router.get("/daily-logs/{dog_id}", response_model=List[DailyLog])
 async def get_daily_logs(dog_id: str, current_user: dict = Depends(get_current_user)):
-    dog = await db.dogs.find_one({"id": dog_id, "owner_id": current_user["id"]})
-    if not dog:
+    """Get daily logs for a dog. RLS enforces ownership."""
+    # Check dog ownership
+    check_response = supabase.table('dogs').select('id').eq('id', dog_id).eq('owner_id', current_user['id']).execute()
+    if not check_response.data:
         raise HTTPException(status_code=404, detail="Dog not found")
     
-    logs = await db.daily_logs.find({"dog_id": dog_id}).sort("logged_at", -1).to_list(100)
-    return [DailyLog(**log) for log in logs]
+    response = supabase.table('daily_logs').select('*').eq('dog_id', dog_id).order('logged_at', desc=True).limit(100).execute()
+    return [DailyLog(**log) for log in response.data]
 
 @api_router.get("/daily-logs/{dog_id}/today")
 async def get_today_log(dog_id: str, current_user: dict = Depends(get_current_user)):
-    dog = await db.dogs.find_one({"id": dog_id, "owner_id": current_user["id"]})
-    if not dog:
+    """Get today's log for a dog."""
+    check_response = supabase.table('dogs').select('id').eq('id', dog_id).eq('owner_id', current_user['id']).execute()
+    if not check_response.data:
         raise HTTPException(status_code=404, detail="Dog not found")
     
     today = date.today().isoformat()
-    log = await db.daily_logs.find_one({"dog_id": dog_id, "date": today})
-    return DailyLog(**log) if log else None
+    response = supabase.table('daily_logs').select('*').eq('dog_id', dog_id).eq('date', today).execute()
+    return DailyLog(**response.data[0]) if response.data else None
 
 @api_router.post("/daily-logs", response_model=DailyLog)
 async def create_daily_log(log_data: DailyLogCreate, current_user: dict = Depends(get_current_user)):
-    dog = await db.dogs.find_one({"id": log_data.dog_id, "owner_id": current_user["id"]})
-    if not dog:
+    """Create daily log. RLS enforces dog ownership."""
+    # Check dog ownership
+    check_response = supabase.table('dogs').select('id').eq('id', log_data.dog_id).eq('owner_id', current_user['id']).execute()
+    if not check_response.data:
         raise HTTPException(status_code=404, detail="Dog not found")
     
     today = date.today().isoformat()
-    existing = await db.daily_logs.find_one({"dog_id": log_data.dog_id, "date": today})
-    if existing:
+    
+    # Check for existing log today
+    existing_response = supabase.table('daily_logs').select('id').eq('dog_id', log_data.dog_id).eq('date', today).execute()
+    if existing_response.data:
         raise HTTPException(status_code=400, detail="Already logged for today")
     
-    daily_log = DailyLog(**log_data.dict())
-    await db.daily_logs.insert_one(daily_log.dict())
+    # Create log
+    log_dict = log_data.model_dump()
+    log_dict['date'] = today
+    log_dict['logged_at'] = datetime.utcnow().isoformat()
     
-    await update_healthspan_stats(log_data.dog_id, current_user["id"])
+    response = supabase.table('daily_logs').insert(log_dict).execute()
     
-    return daily_log
+    # Update healthspan stats (trigger handles this in Supabase, but call manually for consistency)
+    await update_healthspan_stats(log_data.dog_id, current_user['id'])
+    
+    return DailyLog(**response.data[0])
 
 # ============== Healthspan Routes ==============
 
-# Note: calculate_day_score is defined at module level as shared function
-
 async def update_healthspan_stats(dog_id: str, owner_id: str):
-    logs = await db.daily_logs.find({"dog_id": dog_id}).sort("date", -1).to_list(365)
+    """Update healthspan stats for a dog."""
+    logs_response = supabase.table('daily_logs').select('*').eq('dog_id', dog_id).order('date', desc=True).limit(365).execute()
+    logs = logs_response.data
     
     streak = 0
     today = date.today()
@@ -670,30 +836,33 @@ async def update_healthspan_stats(dog_id: str, owner_id: str):
             "score": score
         })
     
+    # Check if stats exist
+    existing = supabase.table('healthspan_stats').select('id').eq('dog_id', dog_id).execute()
+    
     stats = {
         "dog_id": dog_id,
-        "owner_id": owner_id,
-        "streak": streak,
         "total_points": total_points,
+        "streak": streak,
         "weekly_scores": weekly_scores,
-        "updated_at": datetime.utcnow()
+        "calculated_at": datetime.utcnow().isoformat()
     }
     
-    await db.healthspan_stats.update_one(
-        {"dog_id": dog_id},
-        {"$set": stats},
-        upsert=True
-    )
+    if existing.data:
+        supabase.table('healthspan_stats').update(stats).eq('dog_id', dog_id).execute()
+    else:
+        stats["current_score"] = 85
+        supabase.table('healthspan_stats').insert(stats).execute()
 
 @api_router.get("/healthspan/{dog_id}", response_model=HealthspanScore)
 async def get_healthspan(dog_id: str, current_user: dict = Depends(get_current_user)):
-    dog = await db.dogs.find_one({"id": dog_id, "owner_id": current_user["id"]})
-    if not dog:
+    """Get healthspan score for a dog."""
+    dog_response = supabase.table('dogs').select('id').eq('id', dog_id).eq('owner_id', current_user['id']).execute()
+    if not dog_response.data:
         raise HTTPException(status_code=404, detail="Dog not found")
     
-    stats = await db.healthspan_stats.find_one({"dog_id": dog_id})
+    stats_response = supabase.table('healthspan_stats').select('*').eq('dog_id', dog_id).execute()
     
-    if not stats:
+    if not stats_response.data:
         return HealthspanScore(
             dog_id=dog_id,
             score=85,
@@ -703,31 +872,33 @@ async def get_healthspan(dog_id: str, current_user: dict = Depends(get_current_u
             weekly_scores=[]
         )
     
-    latest_log = await db.daily_logs.find_one({"dog_id": dog_id}, sort=[("logged_at", -1)])
-    current_score = calculate_day_score(latest_log) if latest_log else 85
+    stats = stats_response.data[0]
     
-    breed_rank = await db.healthspan_stats.count_documents({
-        "total_points": {"$gt": stats.get("total_points", 0)}
-    }) + 1
+    # Get latest log for current score
+    latest_log_response = supabase.table('daily_logs').select('*').eq('dog_id', dog_id).order('logged_at', desc=True).limit(1).execute()
+    current_score = calculate_day_score(latest_log_response.data[0]) if latest_log_response.data else 85
+    
+    # Calculate rank
+    rank_response = supabase.table('healthspan_stats').select('total_points').gt('total_points', stats.get('total_points', 0)).execute()
+    breed_rank = len(rank_response.data) + 1
     
     return HealthspanScore(
         dog_id=dog_id,
         score=current_score,
-        streak=stats.get("streak", 0),
-        total_points=stats.get("total_points", 0),
+        streak=stats.get('streak', 0),
+        total_points=stats.get('total_points', 0),
         breed_rank=breed_rank,
-        weekly_scores=stats.get("weekly_scores", [])
+        weekly_scores=stats.get('weekly_scores', [])
     )
 
-# ============== Lilo AI Routes (Real AI Integration) ==============
+# ============== Lilo AI Routes ==============
 
 async def generate_ai_insights(dog: dict, logs: List[dict]) -> dict:
-    """Generate AI-powered insights using GPT"""
+    """Generate AI-powered insights using GPT."""
     llm_key = os.environ.get('EMERGENT_LLM_KEY')
     if not llm_key:
         raise HTTPException(status_code=500, detail="AI service not configured")
     
-    # Prepare context for AI
     dog_info = f"""
 Dog Profile:
 - Name: {dog.get('name', 'Unknown')}
@@ -737,7 +908,6 @@ Dog Profile:
 - Activity Level: {dog.get('activity_level', 'Unknown')}
 """
     
-    # Summarize recent logs
     logs_summary = "Recent Health Logs (last 7 days):\n"
     for log in logs[:7]:
         logs_summary += f"- {log.get('date', 'Unknown')}: Mood={log.get('mood', 'N/A')}, Exercise={log.get('exercise_level', 'N/A')}, Nutrition={log.get('nutrition_quality', 'N/A')}\n"
@@ -745,7 +915,6 @@ Dog Profile:
     if not logs:
         logs_summary = "No recent health logs available."
     
-    # Initialize LLM
     chat = LlmChat(
         api_key=llm_key,
         session_id=f"lilo-{dog.get('id', 'unknown')}-{datetime.utcnow().isoformat()}",
@@ -777,9 +946,7 @@ Only output the JSON, nothing else."""
         user_message = UserMessage(text=prompt)
         response = await chat.send_message(user_message)
         
-        # Parse JSON response
         import json
-        # Clean up response if needed
         response_text = response.strip()
         if response_text.startswith("```json"):
             response_text = response_text[7:]
@@ -788,11 +955,9 @@ Only output the JSON, nothing else."""
         if response_text.endswith("```"):
             response_text = response_text[:-3]
         
-        ai_response = json.loads(response_text.strip())
-        return ai_response
+        return json.loads(response_text.strip())
     except Exception as e:
         logger.error(f"AI generation error: {e}")
-        # Fallback response
         return {
             "mood": "Good",
             "summary": f"{dog.get('name', 'Your dog')} is maintaining a healthy routine. Keep up the good work!",
@@ -805,44 +970,580 @@ Only output the JSON, nothing else."""
         }
 
 @api_router.get("/lilo-ai/{dog_id}", response_model=List[LiloReport])
-async def get_lilo_reports(dog_id: str, current_user: dict = Depends(require_premium)):
+@limiter.limit("30/minute")
+async def get_lilo_reports(request: Request, dog_id: str, current_user: dict = Depends(require_premium)):
     """Get Lilo AI reports for a dog. Premium feature."""
-    dog = await db.dogs.find_one({"id": dog_id, "owner_id": current_user["id"]})
-    if not dog:
+    dog_response = supabase.table('dogs').select('id').eq('id', dog_id).eq('owner_id', current_user['id']).execute()
+    if not dog_response.data:
         raise HTTPException(status_code=404, detail="Dog not found")
     
-    reports = await db.lilo_reports.find({"dog_id": dog_id}).sort("created_at", -1).to_list(30)
-    return [LiloReport(**report) for report in reports]
+    response = supabase.table('lilo_reports').select('*').eq('dog_id', dog_id).order('created_at', desc=True).limit(30).execute()
+    return [LiloReport(**report) for report in response.data]
 
 @api_router.post("/lilo-ai/{dog_id}", response_model=LiloReport)
-async def generate_lilo_report(dog_id: str, current_user: dict = Depends(require_premium)):
+@limiter.limit("5/minute")
+async def generate_lilo_report(request: Request, dog_id: str, current_user: dict = Depends(require_premium)):
     """Generate new Lilo AI report. Premium feature."""
-    dog = await db.dogs.find_one({"id": dog_id, "owner_id": current_user["id"]})
-    if not dog:
+    dog_response = supabase.table('dogs').select('*').eq('id', dog_id).eq('owner_id', current_user['id']).execute()
+    if not dog_response.data:
         raise HTTPException(status_code=404, detail="Dog not found")
     
-    # Get recent logs
-    recent_logs = await db.daily_logs.find({"dog_id": dog_id}).sort("logged_at", -1).to_list(7)
+    dog = dog_response.data[0]
     
-    # Generate AI insights
+    recent_logs_response = supabase.table('daily_logs').select('*').eq('dog_id', dog_id).order('logged_at', desc=True).limit(7).execute()
+    recent_logs = recent_logs_response.data
+    
     ai_response = await generate_ai_insights(dog, recent_logs)
     
-    # Calculate healthspan delta
     import random
     healthspan_delta = random.uniform(-0.5, 2.0) if recent_logs else 0
     
-    # Create report
-    report = LiloReport(
+    report_data = {
+        "dog_id": dog_id,
+        "mood": ai_response.get("mood", "Good"),
+        "summary": ai_response.get("summary", f"{dog['name']} is doing well."),
+        "insights": ai_response.get("insights", ["Keep up the great work!"]),
+        "recommendation": ai_response.get("recommendation", "Continue your current routine."),
+        "healthspan_delta": round(healthspan_delta, 2)
+    }
+    
+    response = supabase.table('lilo_reports').insert(report_data).execute()
+    return LiloReport(**response.data[0])
+
+# ============== Lilo Swarm Routes (Enhanced AI) ==============
+
+from lilo_swarm import create_enhanced_swarm, SwarmReport, AgentSelector
+from dataclasses import asdict
+
+@api_router.get("/lilo-swarm/{dog_id}/preview")
+async def get_swarm_preview(
+    request: Request,
+    dog_id: str,
+    mode: str = "quick",
+    current_user: dict = Depends(get_current_user)
+):
+    """
+    Quick swarm analysis preview.
+    
+    Modes:
+    - quick: 3 agents (activity, nutrition, mood) - Free
+    - minimal: 1 agent (mood only) - Free, fastest
+    - auto: Context-based selection - Free
+    """
+    # Verify dog ownership
+    dog_response = supabase.table('dogs').select('*').eq('id', dog_id).eq('owner_id', current_user['id']).execute()
+    if not dog_response.data:
+        raise HTTPException(status_code=404, detail="Dog not found")
+    
+    dog = dog_response.data[0]
+    
+    # Get recent logs
+    logs_response = supabase.table('daily_logs').select('*').eq('dog_id', dog_id).order('logged_at', desc=True).limit(7).execute()
+    recent_logs = logs_response.data
+    
+    # Build context
+    context = {
+        "dog": dog,
+        "recent_logs": recent_logs,
+        "activity_data": {"avg_active_minutes": sum(l.get('active_minutes', 0) for l in recent_logs) / max(len(recent_logs), 1)},
+        "mood_data": {"moods": [l.get('mood') for l in recent_logs]}
+    }
+    
+    try:
+        swarm = create_enhanced_swarm()
+        quick_result = await swarm.quick_analyze(context)
+        return {
+            **quick_result,
+            "mode": mode,
+            "learnings_count": len(swarm.get_dog_learnings(dog_id))
+        }
+    except Exception as e:
+        logger.error(f"Swarm preview error: {e}")
+        raise HTTPException(status_code=503, detail="Swarm analysis temporarily unavailable")
+
+
+@api_router.post("/lilo-swarm/{dog_id}")
+async def generate_swarm_report(
+    request: Request,
+    dog_id: str,
+    mode: str = "auto",
+    current_user: dict = Depends(require_premium)
+):
+    """
+    Generate swarm wellness report with ephemeral agents and learning.
+    
+    Modes:
+    - auto: Context-based selection (recommended)
+    - quick: 3 agents for faster response
+    - full: All 7 agents for maximum depth
+    - minimal: 1 agent, fastest
+    
+    Premium feature.
+    """
+    # Verify dog ownership
+    dog_response = supabase.table('dogs').select('*').eq('id', dog_id).eq('owner_id', current_user['id']).execute()
+    if not dog_response.data:
+        raise HTTPException(status_code=404, detail="Dog not found")
+    
+    dog = dog_response.data[0]
+    
+    # Get recent logs (last 30 days)
+    logs_response = supabase.table('daily_logs').select('*').eq('dog_id', dog_id).order('logged_at', desc=True).limit(30).execute()
+    recent_logs = logs_response.data
+    
+    # Get healthspan stats
+    stats_response = supabase.table('healthspan_stats').select('*').eq('dog_id', dog_id).order('date', desc=True).limit(1).execute()
+    healthspan_stats = stats_response.data[0] if stats_response.data else {}
+    
+    # Get leaderboard entry
+    lb_response = supabase.table('leaderboard_entries').select('*').eq('dog_id', dog_id).execute()
+    leaderboard_entry = lb_response.data[0] if lb_response.data else {}
+    
+    # Build full context
+    context = {
+        "dog": dog,
+        "recent_logs": recent_logs,
+        "healthspan_stats": healthspan_stats,
+        "leaderboard_entry": {
+            "rank": leaderboard_entry.get('rank', 0),
+            "total_points": leaderboard_entry.get('total_points', 0),
+            "streak": leaderboard_entry.get('streak', 0),
+            "score": leaderboard_entry.get('current_score', 85),
+            "total": 100
+        },
+        "environment_data": {
+            "location": "User location",
+            "weather_summary": "Current conditions",
+            "aqi": "Good"
+        },
+        "breed_data": {
+            "traits": "Standard",
+            "common_issues": [],
+            "ideal_weight_range": " breed appropriate"
+        }
+    }
+    
+    try:
+        swarm = create_enhanced_swarm()
+        report = await swarm.analyze(context, mode=mode)
+        
+        # Store report in database
+        report_data = {
+            "dog_id": dog_id,
+            "mood": report.overall_mood,
+            "summary": report.summary,
+            "insights": json.dumps([asdict(i) for i in report.insights]),
+            "recommendation": ", ".join(report.key_recommendations),
+            "healthspan_delta": report.healthspan_delta
+        }
+        
+        stored = supabase.table('lilo_reports').insert(report_data).execute()
+        
+        return {
+            "report_id": stored.data[0]['id'] if stored.data else None,
+            "dog_name": report.dog_name,
+            "overall_mood": report.overall_mood,
+            "overall_score": report.overall_score,
+            "healthspan_delta": report.healthspan_delta,
+            "summary": report.summary,
+            "key_recommendations": report.key_recommendations,
+            "warnings": report.warnings,
+            "insights": [asdict(i) for i in report.insights],
+            "agent_count": report.agent_count,
+            "analysis_duration_ms": report.analysis_duration_ms,
+            "model_used": report.model_used,
+            "mode_used": mode,
+            "learnings_count": len(swarm.get_dog_learnings(dog_id)),
+            "generated_at": report.generated_at.isoformat()
+        }
+        
+    except Exception as e:
+        logger.error(f"Swarm report error: {e}")
+        raise HTTPException(status_code=503, detail="Swarm analysis temporarily unavailable")
+
+
+@api_router.get("/lilo-swarm/{dog_id}/learnings")
+async def get_swarm_learnings(
+    dog_id: str,
+    current_user: dict = Depends(get_current_user)
+):
+    """Get all learned patterns for a dog's swarm."""
+    # Verify dog ownership
+    dog_response = supabase.table('dogs').select('*').eq('id', dog_id).eq('owner_id', current_user['id']).execute()
+    if not dog_response.data:
+        raise HTTPException(status_code=404, detail="Dog not found")
+    
+    try:
+        swarm = create_enhanced_swarm()
+        learnings = swarm.get_dog_learnings(dog_id)
+        return {
+            "dog_id": dog_id,
+            "dog_name": dog_response.data[0].get("name"),
+            "learnings_count": len(learnings),
+            "learnings": learnings
+        }
+    except Exception as e:
+        logger.error(f"Get learnings error: {e}")
+        raise HTTPException(status_code=503, detail="Could not retrieve learnings")
+
+
+@api_router.post("/lilo-swarm/{dog_id}/validate")
+async def validate_learning(
+    dog_id: str,
+    validation: dict,
+    current_user: dict = Depends(get_current_user)
+):
+    """
+    Validate a learned pattern based on user feedback.
+    
+    Body: {"pattern": "...", "accepted": true/false}
+    """
+    # Verify dog ownership
+    dog_response = supabase.table('dogs').select('*').eq('id', dog_id).eq('owner_id', current_user['id']).execute()
+    if not dog_response.data:
+        raise HTTPException(status_code=404, detail="Dog not found")
+    
+    pattern = validation.get("pattern", "")
+    accepted = validation.get("accepted", True)
+    
+    if not pattern:
+        raise HTTPException(status_code=400, detail="Pattern is required")
+    
+    try:
+        swarm = create_enhanced_swarm()
+        swarm.validate_learning(dog_id, pattern, accepted)
+        return {
+            "success": True,
+            "dog_id": dog_id,
+            "pattern": pattern,
+            "accepted": accepted,
+            "message": "Learning validated and updated" if accepted else "Learning invalidated"
+        }
+    except Exception as e:
+        logger.error(f"Validate learning error: {e}")
+        raise HTTPException(status_code=503, detail="Could not validate learning")
+
+
+# ============== Activity Forecasting Routes (ruv-FANN Inspired) ==============
+
+from activity_forecaster import (
+    create_forecaster,
+    create_recovery_forecaster,
+    logs_to_datapoints
+)
+
+@api_router.get("/activity-forecast/{dog_id}")
+async def get_activity_forecast(
+    request: Request,
+    dog_id: str,
+    days: int = 7,
+    current_user: dict = Depends(get_current_user)
+):
+    """
+    Get activity forecast for a dog.
+    
+    Uses time-series analysis to predict future activity patterns.
+    Free feature - great for motivation!
+    
+    Args:
+        days: Number of days to forecast (default: 7, max: 14)
+    """
+    # Verify dog ownership
+    dog_response = supabase.table('dogs').select('*').eq('id', dog_id).eq('owner_id', current_user['id']).execute()
+    if not dog_response.data:
+        raise HTTPException(status_code=404, detail="Dog not found")
+    
+    dog = dog_response.data[0]
+    
+    # Get historical activity logs (last 30 days)
+    logs_response = supabase.table('daily_logs').select('*').eq('dog_id', dog_id).order('logged_at', desc=True).limit(30).execute()
+    logs = logs_response.data
+    
+    if len(logs) < 3:
+        return {
+            "error": "insufficient_data",
+            "message": f"Need at least 3 days of data. Currently have {len(logs)} days.",
+            "days_needed": 3 - len(logs),
+            "dog_name": dog.get("name")
+        }
+    
+    # Convert to data points
+    data_points = logs_to_datapoints(logs)
+    
+    # Generate forecast
+    forecaster = create_forecaster()
+    forecast = forecaster.forecast(
         dog_id=dog_id,
-        mood=ai_response.get("mood", "Good"),
-        summary=ai_response.get("summary", f"{dog['name']} is doing well."),
-        insights=ai_response.get("insights", ["Keep up the great work!"]),
-        recommendation=ai_response.get("recommendation", "Continue your current routine."),
-        healthspan_delta=round(healthspan_delta, 2)
+        dog_name=dog.get("name", "Unknown"),
+        data_points=data_points,
+        forecast_days=min(days, 14)  # Cap at 14 days
     )
     
-    await db.lilo_reports.insert_one(report.dict())
-    return report
+    return {
+        "forecast_id": f"forecast_{dog_id}_{datetime.utcnow().strftime('%Y%m%d')}",
+        "dog_id": dog_id,
+        "dog_name": forecast.dog_name,
+        "generated_at": forecast.generated_at.isoformat(),
+        "analysis": {
+            "days_analyzed": forecast.days_analyzed,
+            "avg_daily_minutes": forecast.avg_daily_minutes,
+            "avg_daily_steps": forecast.avg_daily_steps,
+            "activity_trend": forecast.activity_trend,
+            "consistency_score": forecast.consistency_score,
+            "best_day": forecast.best_day,
+            "cycle_detected": forecast.cycle_detected
+        },
+        "predictions": [
+            {
+                "date": f.date,
+                "predicted_minutes": f.predicted_minutes,
+                "confidence": f.confidence,
+                "trend": f.trend,
+                "factors": f.factors
+            }
+            for f in forecast.forecast
+        ],
+        "anomalies": forecast.anomalies,
+        "recommendations": forecast.recommendations
+    }
+
+
+@api_router.get("/activity-forecast/{dog_id}/summary")
+async def get_forecast_summary(
+    dog_id: str,
+    current_user: dict = Depends(get_current_user)
+):
+    """
+    Get a quick forecast summary without full details.
+    Perfect for dashboard widgets.
+    """
+    # Verify dog ownership
+    dog_response = supabase.table('dogs').select('*').eq('id', dog_id).eq('owner_id', current_user['id']).execute()
+    if not dog_response.data:
+        raise HTTPException(status_code=404, detail="Dog not found")
+    
+    dog = dog_response.data[0]
+    
+    # Get recent logs
+    logs_response = supabase.table('daily_logs').select('*').eq('dog_id', dog_id).order('logged_at', desc=True).limit(14).execute()
+    logs = logs_response.data
+    
+    if len(logs) < 3:
+        return {
+            "trend": "unknown",
+            "prediction_tomorrow": None,
+            "confidence": 0,
+            "message": "Need more data"
+        }
+    
+    data_points = logs_to_datapoints(logs)
+    forecaster = create_forecaster()
+    forecast = forecaster.forecast(dog_id, dog.get("name", "Unknown"), data_points, 1)
+    
+    tomorrow = forecast.forecast[0] if forecast.forecast else None
+    
+    return {
+        "dog_name": forecast.dog_name,
+        "trend": forecast.activity_trend,
+        "prediction_tomorrow": tomorrow.predicted_minutes if tomorrow else None,
+        "confidence": tomorrow.confidence if tomorrow else 0,
+        "consistency": forecast.consistency_score,
+        "best_day": forecast.best_day,
+        "recommendation": forecast.recommendations[0] if forecast.recommendations else None
+    }
+
+
+@api_router.get("/recovery-estimate/{dog_id}")
+async def get_recovery_estimate(
+    dog_id: str,
+    current_user: dict = Depends(get_current_user)
+):
+    """
+    Estimate recovery time for a dog.
+    
+    Based on age, health history, and current wellness score.
+    Premium feature.
+    """
+    # Verify premium access
+    if not current_user.get("is_premium", False):
+        raise HTTPException(status_code=403, detail="Premium feature")
+    
+    # Verify dog ownership
+    dog_response = supabase.table('dogs').select('*').eq('id', dog_id).eq('owner_id', current_user['id']).execute()
+    if not dog_response.data:
+        raise HTTPException(status_code=404, detail="Dog not found")
+    
+    dog = dog_response.data[0]
+    
+    # Get healthspan stats
+    stats_response = supabase.table('healthspan_stats').select('*').eq('dog_id', dog_id).order('date', desc=True).limit(1).execute()
+    health_score = 80.0  # Default
+    if stats_response.data:
+        health_score = stats_response.data[0].get('current_score', 80.0)
+    
+    # Calculate recovery estimate
+    recovery_forecaster = create_recovery_forecaster()
+    estimate = recovery_forecaster.estimate_recovery(
+        dog_age=dog.get('age_years', 3),
+        previous_recovery_days=[],  # Would need historical data
+        current_health_score=health_score
+    )
+    
+    return {
+        "dog_id": dog_id,
+        "dog_name": dog.get('name'),
+        "dog_age": dog.get('age_years'),
+        "current_health_score": health_score,
+        "recovery_estimate": estimate
+    }
+
+
+# ============== Photo Mood Analysis Routes ==============
+
+from photo_mood_analyzer import create_photo_analyzer, create_photo_analysis_agent
+from pydantic import BaseModel
+
+class PhotoAnalysisRequest(BaseModel):
+    photo_data: str  # Base64 encoded image
+    photo_id: Optional[str] = None
+
+@api_router.post("/photos/{dog_id}/analyze")
+async def analyze_dog_photo(
+    request: Request,
+    dog_id: str,
+    analysis_request: PhotoAnalysisRequest,
+    current_user: dict = Depends(get_current_user)
+):
+    """
+    Analyze a dog photo for mood and wellness indicators.
+    
+    Accepts base64-encoded images and returns mood analysis.
+    Premium feature - requires subscription.
+    """
+    # Verify premium access
+    if not current_user.get("is_premium", False):
+        raise HTTPException(status_code=403, detail="Premium feature")
+    
+    # Verify dog ownership
+    dog_response = supabase.table('dogs').select('*').eq('id', dog_id).eq('owner_id', current_user['id']).execute()
+    if not dog_response.data:
+        raise HTTPException(status_code=404, detail="Dog not found")
+    
+    dog = dog_response.data[0]
+    photo_id = analysis_request.photo_id or f"photo_{datetime.utcnow().strftime('%Y%m%d%H%M%S')}"
+    
+    try:
+        analyzer = create_photo_analyzer()
+        analysis = await analyzer.analyze_photo(
+            photo_data=analysis_request.photo_data,
+            dog_id=dog_id,
+            photo_id=photo_id
+        )
+        
+        return {
+            "photo_id": photo_id,
+            "dog_id": dog_id,
+            "dog_name": dog.get('name'),
+            "analyzed_at": analysis.analyzed_at.isoformat(),
+            "mood": {
+                "state": analysis.mood.value,
+                "confidence": analysis.mood_confidence,
+                "indicators": analysis.mood_indicators
+            },
+            "energy": {
+                "level": analysis.energy_level.value,
+                "indicators": analysis.energy_indicators
+            },
+            "health": {
+                "status": analysis.health_status.value,
+                "notes": analysis.health_notes
+            },
+            "physical": {
+                "posture_score": analysis.posture_score,
+                "eye_clarity": analysis.eye_clarity,
+                "coat_condition": analysis.coat_condition,
+                "apparent_weight": analysis.apparent_weight
+            },
+            "wellness_score": analysis.overall_wellness_score,
+            "recommendations": analysis.recommendations,
+            "warnings": analysis.warnings,
+            "analysis_method": analysis.analysis_method
+        }
+        
+    except Exception as e:
+        logger.error(f"Photo analysis error: {e}")
+        raise HTTPException(status_code=503, detail="Photo analysis failed")
+
+
+@api_router.get("/photos/{dog_id}/mood-history")
+async def get_mood_history(
+    dog_id: str,
+    days: int = 7,
+    current_user: dict = Depends(get_current_user)
+):
+    """
+    Get aggregated mood history from photo analyses.
+    
+    Returns trend analysis and insights from recent photo analyses.
+    """
+    # Verify dog ownership
+    dog_response = supabase.table('dogs').select('*').eq('id', dog_id).eq('owner_id', current_user['id']).execute()
+    if not dog_response.data:
+        raise HTTPException(status_code=404, detail="Dog not found")
+    
+    dog = dog_response.data[0]
+    
+    # For now, return mock data
+    # In production, this would query stored photo analyses
+    return {
+        "dog_id": dog_id,
+        "dog_name": dog.get('name'),
+        "period_days": days,
+        "photo_count": 0,
+        "message": "Photo mood history will be available after analyzing photos",
+        "dominant_mood": "unknown",
+        "mood_trend": "stable",
+        "insights": ["Upload photos to build mood history"]
+    }
+
+
+@api_router.post("/photos/{dog_id}/analyze-quick")
+async def quick_photo_check(
+    request: Request,
+    dog_id: str,
+    analysis_request: PhotoAnalysisRequest,
+    current_user: dict = Depends(get_current_user)
+):
+    """
+    Quick photo mood check - simplified analysis.
+    
+    Free feature - basic mood assessment only.
+    """
+    # Verify dog ownership
+    dog_response = supabase.table('dogs').select('*').eq('id', dog_id).eq('owner_id', current_user['id']).execute()
+    if not dog_response.data:
+        raise HTTPException(status_code=404, detail="Dog not found")
+    
+    try:
+        analyzer = create_photo_analyzer()
+        analysis = await analyzer.analyze_photo(
+            photo_data=analysis_request.photo_data,
+            dog_id=dog_id
+        )
+        
+        return {
+            "dog_id": dog_id,
+            "mood": analysis.mood.value,
+            "mood_confidence": analysis.mood_confidence,
+            "energy": analysis.energy_level.value,
+            "quick_summary": f"{dog.get('name')} appears {analysis.mood.value}",
+            "recommendation": analysis.recommendations[0] if analysis.recommendations else None
+        }
+        
+    except Exception as e:
+        logger.error(f"Quick photo analysis error: {e}")
+        raise HTTPException(status_code=503, detail="Analysis failed")
+
 
 # ============== Stripe Payment Routes ==============
 
@@ -853,7 +1554,7 @@ async def get_subscription_plans():
 
 @api_router.post("/subscription/checkout")
 async def create_checkout_session(request: CheckoutRequest, http_request: Request, current_user: dict = Depends(get_current_user)):
-    """Create a Stripe checkout session for subscription"""
+    """Create a Stripe checkout session for subscription."""
     
     if request.plan_id not in SUBSCRIPTION_PLANS:
         raise HTTPException(status_code=400, detail="Invalid subscription plan")
@@ -865,16 +1566,13 @@ async def create_checkout_session(request: CheckoutRequest, http_request: Reques
     if not stripe_api_key:
         raise HTTPException(status_code=500, detail="Payment service not configured")
     
-    # Build URLs from frontend origin
     success_url = f"{request.origin_url}/subscription/success?session_id={{CHECKOUT_SESSION_ID}}"
     cancel_url = f"{request.origin_url}/subscription/cancel"
     
-    # Initialize Stripe
     host_url = str(http_request.base_url)
-    webhook_url = f"{host_url}api/webhook/stripe"
+    webhook_url = f"{host_url}api/v1/webhook/stripe"
     stripe_checkout = StripeCheckout(api_key=stripe_api_key, webhook_url=webhook_url)
     
-    # Create checkout session
     checkout_request = CheckoutSessionRequest(
         amount=amount,
         currency="usd",
@@ -890,17 +1588,16 @@ async def create_checkout_session(request: CheckoutRequest, http_request: Reques
     session = await stripe_checkout.create_checkout_session(checkout_request)
     
     # Create payment transaction record
-    transaction = PaymentTransaction(
-        user_id=current_user["id"],
-        session_id=session.session_id,
-        plan_id=request.plan_id,
-        amount=amount,
-        currency="usd",
-        status="initiated",
-        payment_status="pending"
-    )
+    transaction_data = {
+        "user_id": current_user["id"],
+        "session_id": session.session_id,
+        "plan_id": request.plan_id,
+        "amount": amount,
+        "status": "initiated",
+        "payment_status": "pending"
+    }
     
-    await db.payment_transactions.insert_one(transaction.dict())
+    supabase_admin.table('payment_transactions').insert(transaction_data).execute()
     
     return {
         "checkout_url": session.url,
@@ -909,8 +1606,7 @@ async def create_checkout_session(request: CheckoutRequest, http_request: Reques
 
 @api_router.get("/subscription/status/{session_id}")
 async def get_checkout_status(session_id: str, current_user: dict = Depends(get_current_user)):
-    """Check the status of a checkout session"""
-    
+    """Check the status of a checkout session."""
     stripe_api_key = os.environ.get('STRIPE_API_KEY')
     if not stripe_api_key:
         raise HTTPException(status_code=500, detail="Payment service not configured")
@@ -920,41 +1616,34 @@ async def get_checkout_status(session_id: str, current_user: dict = Depends(get_
     try:
         status = await stripe_checkout.get_checkout_status(session_id)
         
-        # Update transaction in database
-        transaction = await db.payment_transactions.find_one({"session_id": session_id})
+        # Update transaction
+        transaction_response = supabase_admin.table('payment_transactions').select('*').eq('session_id', session_id).execute()
         
-        if transaction and transaction.get("payment_status") != "paid":
+        if transaction_response.data and transaction_response.data[0].get("payment_status") != "paid":
             update_data = {
                 "status": status.status,
                 "payment_status": status.payment_status,
-                "updated_at": datetime.utcnow()
+                "updated_at": datetime.utcnow().isoformat()
             }
             
-            await db.payment_transactions.update_one(
-                {"session_id": session_id},
-                {"$set": update_data}
-            )
+            supabase_admin.table('payment_transactions').update(update_data).eq('session_id', session_id).execute()
             
-            # If payment successful, update user subscription
             if status.payment_status == "paid":
                 plan_id = status.metadata.get("plan_id", "monthly")
                 plan = SUBSCRIPTION_PLANS.get(plan_id, SUBSCRIPTION_PLANS["monthly"])
                 
-                # Calculate expiration
                 if plan["period"] == "month":
                     expires = datetime.utcnow() + timedelta(days=30)
                 else:
                     expires = datetime.utcnow() + timedelta(days=365)
                 
-                await db.users.update_one(
-                    {"id": current_user["id"]},
-                    {"$set": {
-                        "is_premium": True,
-                        "subscription_status": "active",
-                        "subscription_plan": plan_id,
-                        "subscription_expires": expires
-                    }}
-                )
+                supabase_admin.table('user_profiles').update({
+                    "is_premium": True,
+                    "subscription_status": "active",
+                    "subscription_plan": plan_id,
+                    "subscription_expires": expires.isoformat(),
+                    "updated_at": datetime.utcnow().isoformat()
+                }).eq('id', current_user["id"]).execute()
         
         return {
             "status": status.status,
@@ -968,7 +1657,7 @@ async def get_checkout_status(session_id: str, current_user: dict = Depends(get_
 
 @api_router.get("/subscription/current")
 async def get_current_subscription(current_user: dict = Depends(get_current_user)):
-    """Get current user's subscription status"""
+    """Get current user's subscription status."""
     return {
         "is_premium": current_user.get("is_premium", False),
         "subscription_status": current_user.get("subscription_status"),
@@ -978,7 +1667,7 @@ async def get_current_subscription(current_user: dict = Depends(get_current_user
 
 @api_router.post("/webhook/stripe")
 async def stripe_webhook(request: Request):
-    """Handle Stripe webhooks"""
+    """Handle Stripe webhooks."""
     stripe_api_key = os.environ.get('STRIPE_API_KEY')
     if not stripe_api_key:
         raise HTTPException(status_code=500, detail="Payment service not configured")
@@ -990,16 +1679,12 @@ async def stripe_webhook(request: Request):
         stripe_checkout = StripeCheckout(api_key=stripe_api_key, webhook_url="")
         webhook_response = await stripe_checkout.handle_webhook(body, signature)
         
-        # Update transaction based on webhook
         if webhook_response.session_id:
-            await db.payment_transactions.update_one(
-                {"session_id": webhook_response.session_id},
-                {"$set": {
-                    "status": webhook_response.event_type,
-                    "payment_status": webhook_response.payment_status,
-                    "updated_at": datetime.utcnow()
-                }}
-            )
+            supabase_admin.table('payment_transactions').update({
+                "status": webhook_response.event_type,
+                "payment_status": webhook_response.payment_status,
+                "updated_at": datetime.utcnow().isoformat()
+            }).eq('session_id', webhook_response.session_id).execute()
         
         return {"received": True}
     except Exception as e:
@@ -1047,7 +1732,8 @@ TOXIC_FOODS = {
 }
 
 @api_router.get("/food-search")
-async def search_food(query: str, current_user: dict = Depends(require_premium)):
+@limiter.limit("30/minute")
+async def search_food(request: Request, query: str, current_user: dict = Depends(require_premium)):
     """Search food safety database. Premium feature."""
     query_lower = query.lower()
     results = []
@@ -1076,10 +1762,9 @@ async def api_search_breeds(q: str, limit: int = 10):
 
 @api_router.get("/breeds/{breed_id}/insights")
 async def api_get_breed_insights(breed_id: str, current_user: dict = Depends(get_current_user)):
-    """Get health insights for a specific breed. Uses Dog API for accurate data."""
+    """Get health insights for a specific breed."""
     breed = await get_breed_by_id(breed_id)
     if not breed:
-        # Try searching by name as fallback
         search_results = await search_breeds(breed_id)
         if search_results:
             breed = search_results[0]
@@ -1090,15 +1775,17 @@ async def api_get_breed_insights(breed_id: str, current_user: dict = Depends(get
     return insights
 
 @api_router.post("/foods/search")
-async def api_search_foods_usda(query: str, limit: int = 10, current_user: dict = Depends(require_premium)):
-    """Search foods using USDA database with accurate nutrition info. Premium feature."""
+@limiter.limit("30/minute")
+async def api_search_foods_usda(request: Request, query: str, limit: int = 10, current_user: dict = Depends(require_premium)):
+    """Search foods using USDA database. Premium feature."""
     foods = await search_foods(query, limit)
     results = [analyze_food_for_dogs(food) for food in foods]
     return {"foods": results}
 
 @api_router.get("/foods/{fdc_id}")
-async def api_get_food_details(fdc_id: str, current_user: dict = Depends(require_premium)):
-    """Get detailed nutrition info for a specific food from USDA. Premium feature."""
+@limiter.limit("30/minute")
+async def api_get_food_details(request: Request, fdc_id: str, current_user: dict = Depends(require_premium)):
+    """Get detailed nutrition info for a specific food. Premium feature."""
     food = await get_food_by_id(fdc_id)
     if not food:
         raise HTTPException(status_code=404, detail="Food not found")
@@ -1108,10 +1795,7 @@ async def api_get_food_details(fdc_id: str, current_user: dict = Depends(require
 
 @api_router.get("/weather/current")
 async def api_get_weather(lat: float, lon: float, current_user: dict = Depends(get_current_user)):
-    """
-    Get current weather and walk recommendations. FREE for all users.
-    This is a value-add feature to attract new users.
-    """
+    """Get current weather and walk recommendations. FREE for all users."""
     weather = await get_current_weather(lat, lon)
     if not weather:
         raise HTTPException(status_code=503, detail="Weather service unavailable")
@@ -1124,9 +1808,7 @@ async def api_get_weather(lat: float, lon: float, current_user: dict = Depends(g
 
 @api_router.get("/weather/forecast")
 async def api_get_weather_forecast(lat: float, lon: float, hours: int = 24, current_user: dict = Depends(get_current_user)):
-    """
-    Get weather forecast with best walk times. FREE for all users.
-    """
+    """Get weather forecast with best walk times. FREE for all users."""
     forecast = await get_forecast(lat, lon, hours)
     if not forecast:
         raise HTTPException(status_code=503, detail="Forecast service unavailable")
@@ -1139,7 +1821,8 @@ async def api_get_weather_forecast(lat: float, lon: float, hours: int = 24, curr
     }
 
 @api_router.get("/air-quality")
-async def api_get_air_quality(zip_code: str, current_user: dict = Depends(require_premium)):
+@limiter.limit("30/minute")
+async def api_get_air_quality(request: Request, zip_code: str, current_user: dict = Depends(require_premium)):
     """Get air quality index for location. Premium feature."""
     aqi_data = await get_air_quality(zip_code)
     if not aqi_data:
@@ -1156,10 +1839,7 @@ async def api_calculate_healthspan(
     breed_baseline: float = 85.0,
     current_user: dict = Depends(get_current_user)
 ):
-    """
-    Calculate healthspan score based on multiple factors.
-    Returns overall score, component scores, and projected impact.
-    """
+    """Calculate healthspan score based on multiple factors."""
     result = calculate_healthspan_contribution(
         activity_score,
         nutrition_score,
@@ -1172,13 +1852,14 @@ async def api_calculate_healthspan(
 
 @api_router.get("/")
 async def root():
-    return {"message": "Welcome to Canine.Fit API", "version": "1.0.0"}
+    return {"message": "Welcome to Canine.Fit API", "version": "2.0.0", "database": "Supabase"}
 
 # ============== AI Agent Routes (Admin) ==============
 
 from ai_agents import LeaderboardPopulator, DogProfileGenerator
 
 @api_router.post("/admin/populate-leaderboard")
+@limiter.limit("1/minute")
 async def populate_leaderboard(
     request: Request,
     generate_photos: bool = True,
@@ -1186,169 +1867,122 @@ async def populate_leaderboard(
     admin_key: str = Header(None, alias="X-Admin-Key")
 ):
     """Populate leaderboard with AI-generated dog profiles (Admin only)"""
-    # Admin key from environment variable
-    valid_admin_key = get_admin_key()
-    if not valid_admin_key or admin_key != valid_admin_key:
+    if not validate_admin_key(admin_key):
+        logger.warning(f"Invalid admin key attempt from {request.client.host}")
         raise HTTPException(status_code=403, detail="Invalid admin key")
     
-    populator = LeaderboardPopulator(db)
-    
-    # Run in background to avoid timeout
-    import asyncio
-    asyncio.create_task(populator.populate_leaderboard(
-        generate_photos=generate_photos,
-        batch_size=batch_size
-    ))
-    
+    # Note: AI agent functions need adaptation for Supabase
+    # For now, return a message that this needs updating
     return {
-        "message": "Leaderboard population started in background",
-        "note": "This process generates AI profiles with photos - it may take several minutes"
+        "message": "Leaderboard population requires update for Supabase",
+        "note": "AI agent functions need adaptation for Supabase client"
     }
 
 @api_router.post("/admin/update-ai-activity")
+@limiter.limit("5/minute")
 async def update_ai_activity(
     request: Request,
     admin_key: str = Header(None, alias="X-Admin-Key")
 ):
-    """Update daily activity for AI profiles (simulates daily logging)"""
-    valid_admin_key = get_admin_key()
-    if not valid_admin_key or admin_key != valid_admin_key:
+    """Update daily activity for AI profiles (Admin only)"""
+    if not validate_admin_key(admin_key):
+        logger.warning(f"Invalid admin key attempt from {request.client.host}")
         raise HTTPException(status_code=403, detail="Invalid admin key")
     
-    populator = LeaderboardPopulator(db)
-    updated = await populator.update_ai_profiles_activity()
-    
-    return {"message": f"Updated activity for {updated} AI profiles"}
+    return {"message": "AI activity update requires Supabase adaptation"}
 
 @api_router.get("/admin/ai-profiles-count")
+@limiter.limit("10/minute")
 async def get_ai_profiles_count(
     request: Request,
     admin_key: str = Header(None, alias="X-Admin-Key")
 ):
     """Get count of AI-generated profiles"""
-    valid_admin_key = get_admin_key()
-    if not valid_admin_key or admin_key != valid_admin_key:
+    if not validate_admin_key(admin_key):
+        logger.warning(f"Invalid admin key attempt from {request.client.host}")
         raise HTTPException(status_code=403, detail="Invalid admin key")
     
-    count = await db.dogs.count_documents({"is_ai_profile": True})
-    logs_count = await db.daily_logs.count_documents({"is_ai_generated": True})
+    dogs_response = supabase_admin.table('dogs').select('id', count='exact').eq('is_ai_profile', True).execute()
+    logs_response = supabase_admin.table('daily_logs').select('id', count='exact').eq('is_ai_generated', True).execute()
     
     return {
-        "ai_dog_profiles": count,
-        "ai_daily_logs": logs_count
+        "ai_dog_profiles": len(dogs_response.data),
+        "ai_daily_logs": len(logs_response.data)
     }
 
 @api_router.delete("/admin/clear-ai-profiles")
+@limiter.limit("1/minute")
 async def clear_ai_profiles(
     request: Request,
     admin_key: str = Header(None, alias="X-Admin-Key")
 ):
     """Clear all AI-generated profiles (Admin only)"""
-    valid_admin_key = get_admin_key()
-    if not valid_admin_key or admin_key != valid_admin_key:
+    if not validate_admin_key(admin_key):
+        logger.warning(f"Invalid admin key attempt from {request.client.host}")
         raise HTTPException(status_code=403, detail="Invalid admin key")
     
-    dogs_deleted = await db.dogs.delete_many({"is_ai_profile": True})
-    logs_deleted = await db.daily_logs.delete_many({"is_ai_generated": True})
-    stats_deleted = await db.healthspan_stats.delete_many({"is_ai_generated": True})
-    reports_deleted = await db.lilo_reports.delete_many({"is_ai_generated": True})
+    dogs_deleted = supabase_admin.table('dogs').delete().eq('is_ai_profile', True).execute()
+    logs_deleted = supabase_admin.table('daily_logs').delete().eq('is_ai_generated', True).execute()
+    stats_deleted = supabase_admin.table('healthspan_stats').delete().eq('is_ai_generated', True).execute()
+    reports_deleted = supabase_admin.table('lilo_reports').delete().eq('is_ai_generated', True).execute()
     
     return {
         "deleted": {
-            "dogs": dogs_deleted.deleted_count,
-            "daily_logs": logs_deleted.deleted_count,
-            "healthspan_stats": stats_deleted.deleted_count,
-            "lilo_reports": reports_deleted.deleted_count
+            "dogs": len(dogs_deleted.data) if dogs_deleted.data else 0,
+            "daily_logs": len(logs_deleted.data) if logs_deleted.data else 0,
+            "healthspan_stats": len(stats_deleted.data) if stats_deleted.data else 0,
+            "lilo_reports": len(reports_deleted.data) if reports_deleted.data else 0
         }
     }
 
 # ============== Enhanced Leaderboard (Premium) ==============
 
 @api_router.get("/leaderboard/{breed}")
-async def get_breed_leaderboard(breed: str, current_user: dict = Depends(require_premium), limit: int = 50):
+@limiter.limit("30/minute")
+async def get_breed_leaderboard(request: Request, breed: str, current_user: dict = Depends(require_premium), limit: int = 50):
     """Get leaderboard for a specific breed. Premium feature."""
-    # Get all dogs of this breed with their healthspan stats
-    pipeline = [
-        {"$match": {"breed": breed}},
-        {"$lookup": {
-            "from": "healthspan_stats",
-            "localField": "id",
-            "foreignField": "dog_id",
-            "as": "stats"
-        }},
-        {"$unwind": {"path": "$stats", "preserveNullAndEmptyArrays": True}},
-        {"$project": {
-            "id": 1,
-            "name": 1,
-            "breed": 1,
-            "avatar_url": 1,
-            "is_ai_profile": 1,
-            "total_points": {"$ifNull": ["$stats.total_points", 0]},
-            "streak": {"$ifNull": ["$stats.streak", 0]},
-            "current_score": {"$ifNull": ["$stats.current_score", 85]}
-        }},
-        {"$sort": {"total_points": -1}},
-        {"$limit": limit}
-    ]
+    response = supabase.table('leaderboard_entries').select(
+        '*, dogs(id, name, breed, avatar_url, owner_id)'
+    ).eq('breed', breed).order('total_points', desc=True).limit(limit).execute()
     
-    results = await db.dogs.aggregate(pipeline).to_list(limit)
-    
-    # Add rank
     leaderboard = []
-    for i, dog in enumerate(results):
+    for i, entry in enumerate(response.data):
+        dog = entry.get('dogs', {})
         leaderboard.append({
             "rank": i + 1,
-            "id": dog["id"],
-            "name": dog["name"],
-            "breed": dog["breed"],
-            "avatar_url": dog.get("avatar_url"),
-            "total_points": dog["total_points"],
-            "streak": dog["streak"],
-            "score": dog["current_score"],
-            "is_ai": dog.get("is_ai_profile", False)
+            "id": entry.get('dog_id'),
+            "name": dog.get('name', 'Unknown'),
+            "breed": entry.get('breed'),
+            "avatar_url": dog.get('avatar_url'),
+            "total_points": entry.get('total_points', 0),
+            "streak": entry.get('streak', 0),
+            "score": entry.get('current_score', 85),
+            "is_ai": dog.get('is_ai_profile', False)
         })
     
     return leaderboard
 
 @api_router.get("/leaderboard")
-async def get_global_leaderboard(current_user: dict = Depends(require_premium), limit: int = 100):
+@limiter.limit("30/minute")
+async def get_global_leaderboard(request: Request, current_user: dict = Depends(require_premium), limit: int = 100):
     """Get global leaderboard across all breeds. Premium feature."""
-    pipeline = [
-        {"$lookup": {
-            "from": "healthspan_stats",
-            "localField": "id",
-            "foreignField": "dog_id",
-            "as": "stats"
-        }},
-        {"$unwind": {"path": "$stats", "preserveNullAndEmptyArrays": True}},
-        {"$project": {
-            "id": 1,
-            "name": 1,
-            "breed": 1,
-            "avatar_url": 1,
-            "is_ai_profile": 1,
-            "total_points": {"$ifNull": ["$stats.total_points", 0]},
-            "streak": {"$ifNull": ["$stats.streak", 0]},
-            "current_score": {"$ifNull": ["$stats.current_score", 85]}
-        }},
-        {"$sort": {"total_points": -1}},
-        {"$limit": limit}
-    ]
-    
-    results = await db.dogs.aggregate(pipeline).to_list(limit)
+    response = supabase.table('leaderboard_entries').select(
+        '*, dogs(id, name, breed, avatar_url, owner_id, is_ai_profile)'
+    ).order('total_points', desc=True).limit(limit).execute()
     
     leaderboard = []
-    for i, dog in enumerate(results):
+    for i, entry in enumerate(response.data):
+        dog = entry.get('dogs', {})
         leaderboard.append({
             "rank": i + 1,
-            "id": dog["id"],
-            "name": dog["name"],
-            "breed": dog["breed"],
-            "avatar_url": dog.get("avatar_url"),
-            "total_points": dog["total_points"],
-            "streak": dog["streak"],
-            "score": dog["current_score"],
-            "is_ai": dog.get("is_ai_profile", False)
+            "id": entry.get('dog_id'),
+            "name": dog.get('name', 'Unknown'),
+            "breed": entry.get('breed'),
+            "avatar_url": dog.get('avatar_url'),
+            "total_points": entry.get('total_points', 0),
+            "streak": entry.get('streak', 0),
+            "score": entry.get('current_score', 85),
+            "is_ai": entry.get('is_ai_profile', False)
         })
     
     return leaderboard
@@ -1362,7 +1996,7 @@ app.add_middleware(
     allow_credentials=True,
     allow_origins=ALLOWED_ORIGINS,
     allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-    allow_headers=["Authorization", "Content-Type", "X-Admin-Key"],
+    allow_headers=["Authorization", "Content-Type"],
 )
 
 # Security headers middleware
@@ -1379,24 +2013,5 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
 app.add_middleware(SecurityHeadersMiddleware)
 
 @app.on_event("shutdown")
-async def shutdown_db_client():
-    client.close()
-
-# Create indexes for better performance and token cleanup
-@app.on_event("startup")
-async def startup_db_indexes():
-    # Create index for auth tokens with TTL
-    await db.auth_tokens.create_index("expires_at", expireAfterSeconds=0)  # Auto-delete expired tokens
-    await db.auth_tokens.create_index("token", unique=True)
-    await db.auth_tokens.create_index("user_id")
-    
-    # Create index for users email
-    await db.users.create_index("email", unique=True)
-    
-    # Create indexes for dogs
-    await db.dogs.create_index("owner_id")
-    await db.dogs.create_index("breed")
-    
-    # Create indexes for daily logs
-    await db.daily_logs.create_index("dog_id")
-    await db.daily_logs.create_index([("dog_id", 1), ("date", -1)])
+async def shutdown_clients():
+    pass  # Supabase client doesn't need explicit cleanup

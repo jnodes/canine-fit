@@ -15,7 +15,7 @@ import base64
 from dotenv import load_dotenv
 load_dotenv()
 
-from emergentintegrations.llm.chat import LlmChat, UserMessage
+from openai_integration import LlmChat, UserMessage
 
 # Import shared scoring function from server.py
 import sys
