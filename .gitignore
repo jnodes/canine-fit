@@ -72,6 +72,7 @@ agenthub/agents/youtube/db
 *.pack
 *.deb
 *.dylib
+*.exe
 
 # Build caches
 .cache/

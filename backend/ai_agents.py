@@ -89,7 +89,7 @@ class DogProfileGenerator:
     
     def __init__(self, db):
         self.db = db
-        self.api_key = os.getenv('EMERGENT_LLM_KEY')
+        self.api_key = os.getenv('OPENAI_API_KEY')
         
     async def generate_dog_names(self, breed: str, count: int) -> List[str]:
         """Use AI to generate realistic dog names for a breed"""

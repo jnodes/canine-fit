@@ -895,7 +895,7 @@ async def get_healthspan(dog_id: str, current_user: dict = Depends(get_current_u
 
 async def generate_ai_insights(dog: dict, logs: List[dict]) -> dict:
     """Generate AI-powered insights using GPT."""
-    llm_key = os.environ.get('EMERGENT_LLM_KEY')
+    llm_key = os.environ.get('OPENAI_API_KEY')
     if not llm_key:
         raise HTTPException(status_code=500, detail="AI service not configured")
     
